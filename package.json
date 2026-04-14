@@ -1,0 +1,32 @@
+{
+  "name": "alpha_arcade",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "concurrently \"npm:server\" \"npm:dashboard\"",
+    "server": "npm --prefix server run start",
+    "dashboard": "npm --prefix dashboard run dev",
+    "bot": "tsx alpha_yield_bot.ts",
+    "list-markets": "tsx list_markets.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "description": "",
+  "dependencies": {
+    "@algorandfoundation/algokit-utils": "^9.2.0",
+    "@alpha-arcade/sdk": "github:phara23/alpha-sdk",
+    "algosdk": "^3.5.2",
+    "dotenv": "^17.4.2",
+    "tsx": "^4.21.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.2",
+    "@types/node": "^25.6.0",
+    "concurrently": "^9.1.2",
+    "tailwindcss": "^4.2.2",
+    "wait-on": "^8.0.2"
+  }
+}
