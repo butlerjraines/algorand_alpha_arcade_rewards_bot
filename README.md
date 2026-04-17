@@ -9,6 +9,9 @@
 Special thanks to **Vibekit** for the tools and inspiration! 
 Check them out on [GitHub](https://github.com/gabrielkuettel/vibekit) and [X (Twitter)](https://x.com/getvibekit).
 
+And the wonderful **Alpha Arcade SDK** for making this possible!
+Follow them on [X (Twitter)](https://x.com/alphaarcade).
+
 ---
 
 # 🦅 Alpha Yield Bot: Advanced Market Maker & Harvester
