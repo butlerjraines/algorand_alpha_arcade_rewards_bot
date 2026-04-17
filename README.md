@@ -4,6 +4,13 @@
 > **PROOF OF CONCEPT. USE AT OWN RISK.** 
 > This software is provided "as is" without any guarantees or claims regarding profitability. Automated trading carries significant risk, and using this bot **may result in financial losses**. It is intended to be a foundation for you to adapt and implement your own strategies.
 
+---
+
+Special thanks to **Vibekit** for the tools and inspiration! 
+Check them out on [GitHub](https://github.com/gabrielkuettel/vibekit) and [X (Twitter)](https://x.com/getvibekit).
+
+---
+
 # 🦅 Alpha Yield Bot: Advanced Market Maker & Harvester
 
 The **Alpha Yield Bot** is a high-performance liquidity incentive harvester designed for the Alpha Arcade protocol on Algorand. It operates as a delta-neutral market maker, focusing on capturing the **2.5x Bilateral Bonus** while aggressively managing positions to stay within the "Reward Zone."
