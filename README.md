@@ -1,5 +1,3 @@
-#  EAGLE: Alpha Arcade Yield Bot
-
 > [!CAUTION]
 > **PROOF OF CONCEPT. USE AT OWN RISK.** 
 > This software is provided "as is" without any guarantees or claims regarding profitability. Automated trading carries significant risk, and using this bot **may result in financial losses**. It is intended to be a foundation for you to adapt and implement your own strategies.
