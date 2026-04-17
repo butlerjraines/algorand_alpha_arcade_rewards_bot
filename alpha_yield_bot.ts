@@ -18,8 +18,8 @@ const useMax = process.argv.includes('--max');
 const nameArgIdx = process.argv.indexOf('--name');
 const cliBotName = nameArgIdx !== -1 ? process.argv[nameArgIdx + 1] : null;
 const bufferArgIdx = process.argv.indexOf('--buffer');
-const cliBufferCents = bufferArgIdx !== -1 
-  ? parseFloat(process.argv[bufferArgIdx + 1]) 
+const cliBufferCents = bufferArgIdx !== -1
+  ? parseFloat(process.argv[bufferArgIdx + 1])
   : (process.env.SAFETY_BUFFER_CENTS ? parseFloat(process.env.SAFETY_BUFFER_CENTS) : 1.5);
 
 const botName = cliBotName || 'Alpha-Yield';
@@ -28,12 +28,12 @@ let botId = ''; // Finalized in main()
 async function sendHeartbeat(botId: string, marketId: number, statusParam: string | any = 'online', activityParam: string = 'Ticking...') {
   try {
     let payload: any = { botId, marketId, status: 'online', name: botId, activity: 'Ticking...' };
-    
+
     if (typeof statusParam === 'object') {
-       payload = { ...payload, ...statusParam };
+      payload = { ...payload, ...statusParam };
     } else {
-       payload.status = statusParam;
-       payload.activity = activityParam;
+      payload.status = statusParam;
+      payload.activity = activityParam;
     }
 
     const resp = await fetch('http://localhost:3001/api/bot/heartbeat', {
@@ -69,7 +69,7 @@ async function main() {
   const marketId = cliMarketId || parseInt(process.env.TARGET_MARKET_ID || '0');
   let targetShares = cliTargetShares || (process.env.ORDER_SIZE_USDC ? parseFloat(process.env.ORDER_SIZE_USDC) : 0);
   botId = process.env.BOT_ID ? `${process.env.BOT_ID}-${marketId}` : `${botName}-${marketId}`;
-  
+
   await sendHeartbeat(botId, marketId, 'online', 'Bot Initializing...');
   const safetyBuffer = Math.round(cliBufferCents * 10000);
   const tickInterval = parseInt(process.env.TICK_INTERVAL || '30') * 1000;
@@ -92,7 +92,7 @@ async function main() {
         const allOrders = await alphaClient.getWalletOrdersFromApi(account.addr.toString());
         const toCancel = allOrders.filter(o => Number(o.marketAppId) === Number(marketId));
         for (const order of toCancel) {
-          await alphaClient.cancelOrder({ marketAppId: order.marketAppId, escrowAppId: order.escrowAppId, orderOwner: account.addr.toString() }).catch(() => {});
+          await alphaClient.cancelOrder({ marketAppId: order.marketAppId, escrowAppId: order.escrowAppId, orderOwner: account.addr.toString() }).catch(() => { });
         }
       } catch (err) { }
     }
@@ -121,7 +121,7 @@ async function main() {
       }
 
       // 2. Calculate Effective Target (higher of Injection, CLI, or Protocol Min)
-      const minRequiredShares = Number(market?.rewardsMinContracts || 100_000_000) / 1e6;
+      const minRequiredShares = (Number(market?.rewardsMinContracts || 100_000_000) / 1e6) + 0.01; // +0.01 to ensure strictly above platform floor
       let effectiveTarget = targetShares;
       if (useMax) {
         effectiveTarget = (walletUsdc * 0.9);
@@ -132,7 +132,7 @@ async function main() {
       // 3. Telemetry and Commands
       const stats = await getTickStats(alphaClient, algodClient, account.addr.toString(), marketId, effectiveTarget, rewardMarkets);
       const signal: any = await sendHeartbeat(botId, marketId, stats);
-      
+
       if (signal && signal.command) {
         if (signal.command === 'STOP_CLEAN' || signal.command === 'STOP') { await cleanup(true); return; }
         if (signal.command === 'STOP_KEEP') { await cleanup(false); return; }
@@ -144,9 +144,20 @@ async function main() {
           }
         }
       }
-      
+
+      if (!market) {
+        console.log(`[${new Date().toLocaleTimeString()}] Waiting for Market ${marketId} data...`);
+        setTimeout(runLoop, 5000);
+        return;
+      }
+
       console.log(`[${new Date().toLocaleTimeString()}] Ticking for ${botId}...`);
-      const tickResult = await tick(alphaClient, algodClient, account.addr.toString(), marketId, effectiveTarget, safetyBuffer, inventoryTicks, zeroInvTicks, liquidationWindow, entryMidpoints, lastMidpoint, cooldownTicks, rewardMarkets);
+
+      const isCrypto = market.categories?.some((c: string) => c.toLowerCase().includes('crypto'));
+      const cryptoBoost = isCrypto ? 10000 : 0;
+      if (isCrypto) { console.log(`🛡️  [CRYPTO] Volatility Buffer Active (+1.0¢)`); }
+
+      const tickResult = await tick(alphaClient, algodClient, account.addr.toString(), marketId, effectiveTarget, safetyBuffer + cryptoBoost, inventoryTicks, zeroInvTicks, liquidationWindow, entryMidpoints, lastMidpoint, cooldownTicks, rewardMarkets);
       if (tickResult) {
         lastMidpoint = tickResult.midpoint;
         cooldownTicks = tickResult.cooldownTicks;
@@ -161,11 +172,11 @@ async function main() {
 }
 
 async function tick(
-  client: AlphaClient, 
-  algodClient: algosdk.Algodv2, 
-  address: string, 
-  marketId: number, 
-  targetShares: number, 
+  client: AlphaClient,
+  algodClient: algosdk.Algodv2,
+  address: string,
+  marketId: number,
+  targetShares: number,
   buffer: number,
   inventoryTicks: { YES: number, NO: number },
   zeroInvTicks: { YES: number, NO: number },
@@ -177,19 +188,42 @@ async function tick(
 ) {
   if (marketId === 0) return { midpoint: lastMidpoint, cooldownTicks };
 
-  const [positions, accountInfo] = await Promise.all([
-    client.getPositions(address),
-    algodClient.accountInformation(address).do()
-  ]);
-
   const market = rewardMarkets.find((m: any) => m.marketAppId === marketId);
-  if (!market) return;
+  if (!market) return { midpoint: lastMidpoint, cooldownTicks };
+
+  const targetQty = Math.round(targetShares * 1e6);
+
+  const [positions, accountInfo, bookSnapshot] = await Promise.all([
+    client.getPositions(address),
+    algodClient.accountInformation(address).do(),
+    client.getFullOrderbookFromApi(market.id)
+  ]);
 
   const usdcAssetId = 31566704;
   const usdcAsset = accountInfo.assets?.find((a: any) => Number(a.assetId ?? a['asset-id']) === usdcAssetId);
   const walletUsdc = Number(usdcAsset ? usdcAsset.amount : 0) / 1e6;
 
-  const midpoint = Number(market.midpoint || 500_000);
+  // Live Midpoint: Fallback to API, but use aggregated bids/asks if available
+  let midpoint = Number(market.midpoint || 500_000);
+  const marketBook = bookSnapshot[marketId.toString()];
+
+  if (marketBook?.bids?.[0] && marketBook?.asks?.[0]) {
+    const bestBid = marketBook.bids[0].price; // e.g., 61.0
+    const bestAsk = marketBook.asks[0].price; // e.g., 68.0
+    const liveMid = Math.round(((bestBid + bestAsk) / 2) * 10000); // Convert to microunits (e.g., 645,000)
+
+    if (Math.abs(liveMid - midpoint) > 5000) {
+      console.log(`📡 [PRICE] Live Sync: ${(liveMid / 1e6).toFixed(3)} | API Lag: ${(midpoint / 1e6).toFixed(3)} (Diff: ${((liveMid - midpoint) / 10000).toFixed(1)}¢)`);
+    }
+    midpoint = liveMid;
+  } else {
+    // Fallback to yesProb if orderbook calculation fails
+    const yesProb = Number(market.yesProb ? market.yesProb * 1e6 : midpoint);
+    if (Math.abs(yesProb - midpoint) > 20000) {
+      console.log(`📡 [PRICE] Using Probability: ${(yesProb / 1e6).toFixed(3)} (API Midpoint seems stale)`);
+      midpoint = yesProb;
+    }
+  }
   const maxSpread = Number(market.rewardsMaxSpread || 100_000);
 
   // Volatility Pause: If midpoint shifts > 3% (30k) in one tick
@@ -204,18 +238,29 @@ async function tick(
   }
 
   // Dynamic Spread Protection: Ensure user buffer is within the platform max reward spread
-  const effectiveBuffer = Math.min(buffer, Math.round(maxSpread * 0.9)); 
+  const effectiveBuffer = Math.min(buffer, Math.round(maxSpread * 0.9));
   if (effectiveBuffer < buffer) {
-    console.log(`📡 [SENSITIVITY] Reward Zone narrowed to ±${(maxSpread/10000).toFixed(1)}¢. Clamping buffer to ${(effectiveBuffer/10000).toFixed(1)}¢.`);
+    console.log(`📡 [SENSITIVITY] Reward Zone narrowed to ±${(maxSpread / 10000).toFixed(1)}¢. Clamping buffer to ${(effectiveBuffer / 10000).toFixed(1)}¢.`);
   }
   const openOrders = await client.getWalletOrdersFromApi(address);
   const marketOrders = openOrders.filter(o => Number(o.marketAppId) === Number(marketId));
   const mPos = positions.find(p => p.marketAppId === marketId);
   const yesInv = (mPos?.yesBalance || 0);
   const noInv = (mPos?.noBalance || 0);
+  const totalRealizedExposure = yesInv + noInv;
+
+  const pendingYesBids = marketOrders.filter(o => o.position === 1 && o.side === 1);
+  const pendingNoBids = marketOrders.filter(o => o.position === 0 && o.side === 1);
+  const totalPendingExposure = pendingYesBids.reduce((s, o) => s + (o.quantity || 0), 0) + pendingNoBids.reduce((s, o) => s + (o.quantity || 0), 0);
+  const isHoldingYes = (yesInv > 100000) || (pendingYesBids.length > 0);
+  const isHoldingNo = (noInv > 100000) || (pendingNoBids.length > 0);
 
   const marketName = market.title || market.name || market.marketName || `Market ${marketId}`;
-  console.log(`[STATUS] ${marketName} (${marketId}) | Target: $${targetShares.toFixed(0)} | Mid: ${(midpoint/1e6).toFixed(3)} | Budget: $${walletUsdc.toFixed(2)} | Inv: Y:${(yesInv/1e6).toFixed(1)}/N:${(noInv/1e6).toFixed(1)}`);
+  const yesPending = pendingYesBids.reduce((s, o) => s + (o.quantity || 0), 0) / 1e6;
+  const noPending = pendingNoBids.reduce((s, o) => s + (o.quantity || 0), 0) / 1e6;
+
+  console.log(`[STATUS] ${marketName} (${marketId}) | Target: ${(targetQty / 1e6).toFixed(2)} | Mid: ${(midpoint / 1e6).toFixed(3)} | Budget: $${walletUsdc.toFixed(2)}`);
+  console.log(`[COMMIT] YES: ${(yesInv / 1e6).toFixed(1)}+(P:${yesPending.toFixed(1)}) | NO: ${(noInv / 1e6).toFixed(1)}+(P:${noPending.toFixed(1)})`);
 
   // --- 1. Budget Management ---
   const currentBidOrders = marketOrders.filter(o => o.side === 1);
@@ -224,18 +269,26 @@ async function tick(
   const budgetTracker = { remaining: totalSpendableUsdc };
 
   // --- 2. Dynamic Target Logic ---
-  const targetQty = Math.round(targetShares * 1e6);
 
   async function maintainBid(side: 'YES' | 'NO', price: number, currentInv: number) {
     const posId = side === 'YES' ? 1 : 0;
     const existing = marketOrders.find(o => o.position === posId && o.side === 1);
+
+    // 1. Exposure Check: Avoid over-buying this specific side
+    const sidePendingBids = side === 'YES' ? pendingYesBids : pendingNoBids;
+    const sideCommitment = currentInv + sidePendingBids.reduce((s, o) => s + (o.quantity || 0), 0);
+
+    if (sideCommitment >= targetQty && !existing) {
+      return;
+    }
+
     const priceUsdc = price / 1e6;
     const idealNeeded = Math.max(0, targetQty - currentInv);
-    
+
     if (idealNeeded < 100000) {
-      console.log(`[SKIP] ${side} Bid: Target reached (Existing: ${(currentInv/1e6).toFixed(1)})`);
+      console.log(`[SKIP] ${side} Bid: Target reached (Existing: ${(currentInv / 1e6).toFixed(1)})`);
       // Entry midpoint is managed by maintainAsk — only reset when inventory is truly zero
-      if (existing) await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => {});
+      if (existing) await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => { });
       return;
     }
 
@@ -244,9 +297,9 @@ async function tick(
     // Inventory Skewing: If already heavy, lower the bid to avoid catching the falling knife
     let effectivePrice = price;
     if (currentInv > (targetQty * 0.5)) {
-        const skew = Math.round(maxSpread * 0.2); // Low-ball by 20% of max spread
-        effectivePrice -= skew;
-        console.log(`🛡️ [SKEW] ${side} Inventory at ${(currentInv/targetQty*100).toFixed(0)}%. Lowering bid price by ${(skew/10000).toFixed(1)}¢.`);
+      const skew = Math.round(maxSpread * 0.2); // Low-ball by 20% of max spread
+      effectivePrice -= skew;
+      console.log(`🛡️ [SKEW] ${side} Inventory at ${(currentInv / targetQty * 100).toFixed(0)}%. Lowering bid price by ${(skew / 10000).toFixed(1)}¢.`);
     }
 
     const MARGIN_FACTOR = 1.04; // Reserved for matcher commission/escrow
@@ -254,34 +307,33 @@ async function tick(
     let needed = idealNeeded;
     let isPartial = false;
     if (costOfIdeal > budgetTracker.remaining) {
-        needed = Math.floor((budgetTracker.remaining * 1e12) / (effectivePrice * MARGIN_FACTOR));
-        isPartial = true;
+      needed = Math.floor((budgetTracker.remaining * 1e12) / (effectivePrice * MARGIN_FACTOR));
+      isPartial = true;
     }
 
     if (needed < 100000) {
-      if (existing) await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => {});
+      if (existing) await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => { });
       return;
     }
-    
+
     if (existing && Math.abs(existing.price - effectivePrice) <= 2000) {
       const qtyDiff = Math.abs(existing.quantity - needed);
-      if (qtyDiff < (needed * 0.05)) { 
-        // Official Quadratic Score: ((maxSpread - distance) / maxSpread)^2
+      if (qtyDiff < (needed * 0.05)) {
         const sideMidpoint = side === 'YES' ? midpoint : (1000000 - midpoint);
         const distance = Math.abs(price - sideMidpoint);
         const score = maxSpread > 0 ? Math.pow(Math.max(0, (maxSpread - distance) / maxSpread), 2) : 0;
-        console.log(`✅ [${side}] Yield order active at ${(price/1e6).toFixed(3)} | 📈 Score: ${score.toFixed(2)}`);
-        budgetTracker.remaining -= (existing.quantity * existing.price) / 1e12; 
-        return; 
+        console.log(`✅ [${side}] Yield order active at ${(price / 1e6).toFixed(3)} | 📈 Score: ${score.toFixed(2)}`);
+        budgetTracker.remaining -= (existing.quantity * existing.price) / 1e12;
+        return;
       }
     }
-    
+
     if (existing) {
-      console.log(`[PURGE] Replacing stale BID for ${side} at ${(existing.price/1e6).toFixed(3)}...`);
-      await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => {});
+      console.log(`[PURGE] Replacing stale BID for ${side} at ${(existing.price / 1e6).toFixed(3)}...`);
+      await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => { });
     }
-    
-    console.log(`[REWARDS] Placing BUY ${side} at ${(effectivePrice/1e6).toFixed(3)} (Qty: ${(needed/1e6).toFixed(1)})${isPartial ? ' (PARTIAL)' : ''}`);
+
+    console.log(`[REWARDS] Placing BUY ${side} at ${(effectivePrice / 1e6).toFixed(3)} (Qty: ${(needed / 1e6).toFixed(1)})${isPartial ? ' (PARTIAL)' : ''}`);
     budgetTracker.remaining -= ((needed * effectivePrice) / 1e12) * MARGIN_FACTOR;
     await client.createLimitOrder({ marketAppId: marketId, position: posId, price: Math.round(effectivePrice), quantity: Math.round(needed), isBuying: true }).catch(e => console.error(`❌ BID Error (${side}): ${e.message}`));
   }
@@ -289,18 +341,18 @@ async function tick(
   async function maintainAsk(side: 'YES' | 'NO', currentInv: number, unmatchedInv: number) {
     const posId = side === 'YES' ? 1 : 0;
     const existing = marketOrders.find(o => o.position === posId && o.side === 0);
-    
+
     if (currentInv < 100000) {
-      // Indexer Latch: Only reset if inventory is 0 for 2 consecutive ticks
+      // Indexer Latch: Only reset if inventory is 0 for 5 consecutive ticks
       zeroInvTicks[side]++;
-      if (zeroInvTicks[side] < 2) {
+      if (zeroInvTicks[side] < 5) {
         console.log(`[STABILITY] ${side} reported as zero. Waiting for confirmation...`);
         return;
       }
 
       if (existing) {
         console.log(`[PURGE] Clearing residual ASK for ${side}`);
-        await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => {});
+        await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => { });
       }
       inventoryTicks[side] = 0;
       entryMidpoints[side] = 0;
@@ -309,29 +361,35 @@ async function tick(
 
     zeroInvTicks[side] = 0; // Reset latch if we have inventory
     inventoryTicks[side]++;
-    if (inventoryTicks[side] === 1) {
-        entryMidpoints[side] = midpoint;
+    if (inventoryTicks[side] === 1 || entryMidpoints[side] === 0) {
+      entryMidpoints[side] = midpoint;
     }
 
     const sideMidpoint = side === 'YES' ? midpoint : (1000000 - midpoint);
     const entrySideMidpoint = side === 'YES' ? entryMidpoints[side] : (1000000 - entryMidpoints[side]);
-    
-    // 2% Circuit Breaker (Stop Loss) — only fires on unmatched inventory
-    // Matched pairs (YES+NO) are price-neutral, so crashing on one side is offset by the other
-    if (unmatchedInv > 100000) {
+
+    // 1. Physical Stop-Loss: Only count assets we actually HOLD in our wallet
+    // We do NOT count pending orders as hedges anymore.
+    const realUnmatchedInv = Math.abs(yesInv - noInv);
+
+    // 5% Circuit Breaker (Emergency Stop) 
+    if (realUnmatchedInv > 100000 && currentInv > matchedInv) {
       const loss = entrySideMidpoint - sideMidpoint;
-      if (loss > 20000) {
-          console.log(`🚨 [CRASH] ${side} price moved down ${(loss/10000).toFixed(1)}¢ from entry. Triggering Emergency Hedge...`);
-          if (existing) await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => {});
-          await client.createMarketOrder({
-              marketAppId: marketId,
-              position: posId,
-              quantity: currentInv,
-              isBuying: false,
-              price: sideMidpoint,
-              slippage: 100000
-          }).catch(e => console.error(`❌ HEDGE Error (${side}): ${e.message}`));
-          return;
+      // Sanity Check: Don't hedge if the deviation from API is too extreme (likely bad data)
+      const isDataSane = Math.abs(sideMidpoint - (side === 'YES' ? market.midpoint : (1000000 - market.midpoint))) < 150000;
+
+      if (loss > 50000 && isDataSane) { // 5¢ threshold
+        console.log(`🚨 [EMERGENCY] ${side} position is losing ${(loss / 10000).toFixed(1)}¢. Triggering Physical Stop-Loss...`);
+        if (existing) await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => { });
+        await client.createMarketOrder({
+          marketAppId: marketId,
+          position: posId,
+          quantity: currentInv,
+          isBuying: false,
+          price: sideMidpoint,
+          slippage: 50000
+        }).catch(e => console.error(`❌ EMERGENCY EXIT Error (${side}): ${e.message}`));
+        return;
       }
     }
 
@@ -341,10 +399,21 @@ async function tick(
     const ticks = inventoryTicks[side];
     let targetAskPrice = sideMidpoint + effectiveBuffer; // Phase 1: Profit Window Target
     let modeText = `Profit Window ${ticks}/${liquidationWindow}`;
-    
-    // A+B+C: Graduated pressure, only on LOSING + UNMATCHED positions
-    if (ticks > liquidationWindow) {
-      if (!isWinning && unmatchedInv > 100000) {
+
+    // A: Check Reward Status & Extreme Volatility
+    const book = bookSnapshot[marketId.toString()];
+    const isBookDeep = (book?.bids?.length || 0) > 1 && (book?.asks?.length || 0) > 1;
+    const priceDrift = entrySideMidpoint - sideMidpoint;
+
+    if (priceDrift > 30000 && realUnmatchedInv > 100000) {
+      // Phase 4: Volatility Bypass (Sharp drop detected, don't wait for windows)
+      targetAskPrice = sideMidpoint - 3000;
+      modeText = `Volatility Exit (-${(priceDrift / 10000).toFixed(1)}¢)`;
+    } else if (!isBookDeep && currentInv > 100000) {
+      targetAskPrice = sideMidpoint;
+      modeText = `Force Exit (Market Illiquid)`;
+    } else if (ticks > liquidationWindow) {
+      if (!isWinning && realUnmatchedInv > 100000) {
         // Phase 3: Aggressive Exit (Losing side with real exposure)
         const overTicks = ticks - liquidationWindow;
         if (overTicks <= 5) {
@@ -365,50 +434,50 @@ async function tick(
     }
 
     if (existing && Math.abs(existing.price - targetAskPrice) <= 2000) {
-      console.log(`✅ [${side}] Sale order active at ${(targetAskPrice/1e6).toFixed(3)} (${modeText})`);
+      console.log(`✅ [${side}] Sale order active at ${(targetAskPrice / 1e6).toFixed(3)} (${modeText})`);
       return;
     }
     if (existing) {
-        console.log(`[PURGE] Replacing stale ASK for ${side} at ${(existing.price/1e6).toFixed(3)}...`);
-        await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => {});
+      console.log(`[PURGE] Replacing stale ASK for ${side} at ${(existing.price / 1e6).toFixed(3)}...`);
+      await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => { });
     }
-    console.log(`[HEDGE] Placing SELL ${side} at ${(targetAskPrice/1e6).toFixed(3)} (${modeText})`);
+    console.log(`[HEDGE] Placing SELL ${side} at ${(targetAskPrice / 1e6).toFixed(3)} (${modeText})`);
     await client.createLimitOrder({ marketAppId: marketId, position: posId, price: Math.round(targetAskPrice), quantity: Math.round(currentInv), isBuying: false }).catch(e => console.error(`❌ ASK Error (${side}): ${e.message}`));
   }
 
   // C: Calculate matched inventory (YES+NO pairs are price-neutral)
   const matchedInv = Math.min(yesInv, noInv);
   if (matchedInv > 100000) {
-    console.log(`🔄 [MATCH] ${(matchedInv/1e6).toFixed(1)} matched YES+NO sets — hedged against price risk.`);
+    console.log(`🔄 [MATCH] ${(matchedInv / 1e6).toFixed(1)} matched YES+NO sets — hedged against price risk.`);
   }
 
   await maintainBid('YES', midpoint - effectiveBuffer, yesInv);
   await maintainAsk('YES', yesInv, yesInv - matchedInv);
-  await maintainBid('NO', (1e6-midpoint) - effectiveBuffer, noInv);
+  await maintainBid('NO', (1000000 - midpoint) - effectiveBuffer, noInv);
   await maintainAsk('NO', noInv, noInv - matchedInv);
 
   return { midpoint, cooldownTicks: currentCooldown };
 }
 
 async function getTickStats(client: AlphaClient, algodClient: algosdk.Algodv2, address: string, marketId: number, targetShares: number, rewardMarkets: any[]) {
-    try {
-        const [positions, accountInfo] = await Promise.all([
-          client.getPositions(address),
-          algodClient.accountInformation(address).do()
-        ]);
-        const market = rewardMarkets.find((m: any) => m.marketAppId === marketId);
-        const mPos = positions.find(p => p.marketAppId === marketId);
-        const usdcAsset = accountInfo.assets?.find((a: any) => Number(a.assetId ?? a['asset-id']) === 31566704);
-        
-        return {
-            size: targetShares,
-            yesMySize: (mPos?.yesBalance || 0) / 1e6,
-            noMySize: (mPos?.noBalance || 0) / 1e6,
-            walletUsdc: Number(usdcAsset ? usdcAsset.amount : 0) / 1e6,
-            status: 'online',
-            activity: 'Ticking...'
-        };
-    } catch (e) { return {}; }
+  try {
+    const [positions, accountInfo] = await Promise.all([
+      client.getPositions(address),
+      algodClient.accountInformation(address).do()
+    ]);
+    const market = rewardMarkets.find((m: any) => m.marketAppId === marketId);
+    const mPos = positions.find(p => p.marketAppId === marketId);
+    const usdcAsset = accountInfo.assets?.find((a: any) => Number(a.assetId ?? a['asset-id']) === 31566704);
+
+    return {
+      size: targetShares,
+      yesMySize: (mPos?.yesBalance || 0) / 1e6,
+      noMySize: (mPos?.noBalance || 0) / 1e6,
+      walletUsdc: Number(usdcAsset ? usdcAsset.amount : 0) / 1e6,
+      status: 'online',
+      activity: 'Ticking...'
+    };
+  } catch (e) { return {}; }
 }
 
 main().catch(console.error);

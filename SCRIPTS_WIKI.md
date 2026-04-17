@@ -35,9 +35,11 @@ The sidebar displays all active bot instances sending heartbeats to the server.
 - **Auto-Cleanup**: Bots that fail to send a heartbeat for > 65 seconds are automatically hidden.
 
 *   `--market <id>`: Overrides the default market ID.
-*   `--size <shares>`: Sets the target order quantity in **shares** (contracts).
+*   `--target <shares>`: Sets the target order quantity in **shares** (contracts).
 *   `--name <label>`: Assigns a name to the bot (e.g., `--name "Aggressive"`). Useful for tracking multiple bots on the dashboard.
 *   `--shutdown`: Enables cleanup mode. When you stop the bot (Ctrl+C), it will automatically cancel its live orders.
+*   `--max`: **Startup allocation.** Uses all available USDC in your wallet (including escrowed balances) to size the position at launch, minus a small safety buffer (e.g., $1.00).
+*   `--compound`: **Dynamic growth.** Continuously re-calculates your balance every tick (30s) and automatically scales up the position size to maintain a 90% allocation as you earn rewards.
 
 **Example: Running a Fleet**
 ```bash
