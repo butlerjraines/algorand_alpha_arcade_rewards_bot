@@ -76,6 +76,7 @@ async function main() {
   const liquidationWindow = parseInt(process.env.LIQUIDATION_WINDOW_TICKS || '2');
   const inventoryTicks = { YES: 0, NO: 0 };
   const entryMidpoints = { YES: 0, NO: 0 };
+  const zeroInvTicks = { YES: 0, NO: 0 }; // Stability latch for indexer lag
   let lastMidpoint = 0;
   let cooldownTicks = 0;
 
@@ -129,7 +130,7 @@ async function main() {
       }
 
       // 3. Telemetry and Commands
-      const stats = await getTickStats(alphaClient, algodClient, account.addr.toString(), marketId, effectiveTarget);
+      const stats = await getTickStats(alphaClient, algodClient, account.addr.toString(), marketId, effectiveTarget, rewardMarkets);
       const signal: any = await sendHeartbeat(botId, marketId, stats);
       
       if (signal && signal.command) {
@@ -145,7 +146,7 @@ async function main() {
       }
       
       console.log(`[${new Date().toLocaleTimeString()}] Ticking for ${botId}...`);
-      const tickResult = await tick(alphaClient, algodClient, account.addr.toString(), marketId, effectiveTarget, safetyBuffer, inventoryTicks, liquidationWindow, entryMidpoints, lastMidpoint, cooldownTicks);
+      const tickResult = await tick(alphaClient, algodClient, account.addr.toString(), marketId, effectiveTarget, safetyBuffer, inventoryTicks, zeroInvTicks, liquidationWindow, entryMidpoints, lastMidpoint, cooldownTicks, rewardMarkets);
       if (tickResult) {
         lastMidpoint = tickResult.midpoint;
         cooldownTicks = tickResult.cooldownTicks;
@@ -167,15 +168,16 @@ async function tick(
   targetShares: number, 
   buffer: number,
   inventoryTicks: { YES: number, NO: number },
+  zeroInvTicks: { YES: number, NO: number },
   liquidationWindow: number,
   entryMidpoints: { YES: number, NO: number },
   lastMidpoint: number,
-  cooldownTicks: number
+  cooldownTicks: number,
+  rewardMarkets: any[]
 ) {
   if (marketId === 0) return { midpoint: lastMidpoint, cooldownTicks };
 
-  const [rewardMarkets, positions, accountInfo] = await Promise.all([
-    client.getRewardMarkets(),
+  const [positions, accountInfo] = await Promise.all([
     client.getPositions(address),
     algodClient.accountInformation(address).do()
   ]);
@@ -232,7 +234,7 @@ async function tick(
     
     if (idealNeeded < 100000) {
       console.log(`[SKIP] ${side} Bid: Target reached (Existing: ${(currentInv/1e6).toFixed(1)})`);
-      entryMidpoints[side] = 0; // Reset entry tracking if position is closed
+      // Entry midpoint is managed by maintainAsk — only reset when inventory is truly zero
       if (existing) await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => {});
       return;
     }
@@ -247,11 +249,12 @@ async function tick(
         console.log(`🛡️ [SKEW] ${side} Inventory at ${(currentInv/targetQty*100).toFixed(0)}%. Lowering bid price by ${(skew/10000).toFixed(1)}¢.`);
     }
 
-    const costOfIdeal = (idealNeeded * priceUsdc) / 1e6;
+    const MARGIN_FACTOR = 1.04; // Reserved for matcher commission/escrow
+    const costOfIdeal = ((idealNeeded * priceUsdc) / 1e6) * MARGIN_FACTOR;
     let needed = idealNeeded;
     let isPartial = false;
     if (costOfIdeal > budgetTracker.remaining) {
-        needed = Math.floor((budgetTracker.remaining * 1e12) / effectivePrice);
+        needed = Math.floor((budgetTracker.remaining * 1e12) / (effectivePrice * MARGIN_FACTOR));
         isPartial = true;
     }
 
@@ -279,15 +282,22 @@ async function tick(
     }
     
     console.log(`[REWARDS] Placing BUY ${side} at ${(effectivePrice/1e6).toFixed(3)} (Qty: ${(needed/1e6).toFixed(1)})${isPartial ? ' (PARTIAL)' : ''}`);
-    budgetTracker.remaining -= (needed * effectivePrice) / 1e12;
+    budgetTracker.remaining -= ((needed * effectivePrice) / 1e12) * MARGIN_FACTOR;
     await client.createLimitOrder({ marketAppId: marketId, position: posId, price: Math.round(effectivePrice), quantity: Math.round(needed), isBuying: true }).catch(e => console.error(`❌ BID Error (${side}): ${e.message}`));
   }
 
-  async function maintainAsk(side: 'YES' | 'NO', currentInv: number) {
+  async function maintainAsk(side: 'YES' | 'NO', currentInv: number, unmatchedInv: number) {
     const posId = side === 'YES' ? 1 : 0;
     const existing = marketOrders.find(o => o.position === posId && o.side === 0);
     
     if (currentInv < 100000) {
+      // Indexer Latch: Only reset if inventory is 0 for 2 consecutive ticks
+      zeroInvTicks[side]++;
+      if (zeroInvTicks[side] < 2) {
+        console.log(`[STABILITY] ${side} reported as zero. Waiting for confirmation...`);
+        return;
+      }
+
       if (existing) {
         console.log(`[PURGE] Clearing residual ASK for ${side}`);
         await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => {});
@@ -297,37 +307,61 @@ async function tick(
       return;
     }
 
+    zeroInvTicks[side] = 0; // Reset latch if we have inventory
     inventoryTicks[side]++;
-    if (inventoryTicks[side] === 1 || entryMidpoints[side] === 0) {
+    if (inventoryTicks[side] === 1) {
         entryMidpoints[side] = midpoint;
     }
 
     const sideMidpoint = side === 'YES' ? midpoint : (1000000 - midpoint);
     const entrySideMidpoint = side === 'YES' ? entryMidpoints[side] : (1000000 - entryMidpoints[side]);
     
-    // 2% Circuit Breaker (Stop Loss)
-    const loss = entrySideMidpoint - sideMidpoint;
-    if (loss > 20000) {
-        console.log(`🚨 [CRASH] ${side} price moved down ${(loss/10000).toFixed(1)}¢ from entry. Triggering Emergency Hedge...`);
-        if (existing) await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => {});
-        await client.createMarketOrder({
-            marketAppId: marketId,
-            position: posId,
-            quantity: currentInv,
-            isBuying: false,
-            price: sideMidpoint, // Reference price
-            slippage: 100000 // 10%
-        }).catch(e => console.error(`❌ HEDGE Error (${side}): ${e.message}`));
-        return;
+    // 2% Circuit Breaker (Stop Loss) — only fires on unmatched inventory
+    // Matched pairs (YES+NO) are price-neutral, so crashing on one side is offset by the other
+    if (unmatchedInv > 100000) {
+      const loss = entrySideMidpoint - sideMidpoint;
+      if (loss > 20000) {
+          console.log(`🚨 [CRASH] ${side} price moved down ${(loss/10000).toFixed(1)}¢ from entry. Triggering Emergency Hedge...`);
+          if (existing) await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => {});
+          await client.createMarketOrder({
+              marketAppId: marketId,
+              position: posId,
+              quantity: currentInv,
+              isBuying: false,
+              price: sideMidpoint,
+              slippage: 100000
+          }).catch(e => console.error(`❌ HEDGE Error (${side}): ${e.message}`));
+          return;
+      }
     }
 
+    // B: Check if this side is winning or losing vs entry
+    const isWinning = sideMidpoint >= entrySideMidpoint;
+
     const ticks = inventoryTicks[side];
-    let targetAskPrice = sideMidpoint;
+    let targetAskPrice = sideMidpoint + effectiveBuffer; // Phase 1: Profit Window Target
     let modeText = `Profit Window ${ticks}/${liquidationWindow}`;
     
+    // A+B+C: Graduated pressure, only on LOSING + UNMATCHED positions
     if (ticks > liquidationWindow) {
-      targetAskPrice = sideMidpoint - 20000;
-      modeText = `Market Sell (Forced)`;
+      if (!isWinning && unmatchedInv > 100000) {
+        // Phase 3: Aggressive Exit (Losing side with real exposure)
+        const overTicks = ticks - liquidationWindow;
+        if (overTicks <= 5) {
+          targetAskPrice = sideMidpoint - 1000; // -0.1¢
+          modeText = `Gentle Exit (${overTicks}t over)`;
+        } else if (overTicks <= 10) {
+          targetAskPrice = sideMidpoint - 3000; // -0.3¢
+          modeText = `Firm Exit (${overTicks}t over)`;
+        } else {
+          targetAskPrice = sideMidpoint - 5000; // -0.5¢
+          modeText = `Forced Exit (${overTicks}t over)`;
+        }
+      } else {
+        // Phase 2: Breakeven Exit (Winning side OR fully matched)
+        targetAskPrice = sideMidpoint;
+        modeText = isWinning ? `Profit Hold (${ticks}t)` : `Matched Hold (${ticks}t)`;
+      }
     }
 
     if (existing && Math.abs(existing.price - targetAskPrice) <= 2000) {
@@ -342,18 +376,23 @@ async function tick(
     await client.createLimitOrder({ marketAppId: marketId, position: posId, price: Math.round(targetAskPrice), quantity: Math.round(currentInv), isBuying: false }).catch(e => console.error(`❌ ASK Error (${side}): ${e.message}`));
   }
 
+  // C: Calculate matched inventory (YES+NO pairs are price-neutral)
+  const matchedInv = Math.min(yesInv, noInv);
+  if (matchedInv > 100000) {
+    console.log(`🔄 [MATCH] ${(matchedInv/1e6).toFixed(1)} matched YES+NO sets — hedged against price risk.`);
+  }
+
   await maintainBid('YES', midpoint - effectiveBuffer, yesInv);
-  await maintainAsk('YES', yesInv);
+  await maintainAsk('YES', yesInv, yesInv - matchedInv);
   await maintainBid('NO', (1e6-midpoint) - effectiveBuffer, noInv);
-  await maintainAsk('NO', noInv);
+  await maintainAsk('NO', noInv, noInv - matchedInv);
 
   return { midpoint, cooldownTicks: currentCooldown };
 }
 
-async function getTickStats(client: AlphaClient, algodClient: algosdk.Algodv2, address: string, marketId: number, targetShares: number) {
+async function getTickStats(client: AlphaClient, algodClient: algosdk.Algodv2, address: string, marketId: number, targetShares: number, rewardMarkets: any[]) {
     try {
-        const [rewardMarkets, positions, accountInfo] = await Promise.all([
-          client.getRewardMarkets(),
+        const [positions, accountInfo] = await Promise.all([
           client.getPositions(address),
           algodClient.accountInformation(address).do()
         ]);
