@@ -1,3 +1,9 @@
+#  EAGLE: Alpha Arcade Yield Bot
+
+> [!CAUTION]
+> **PROOF OF CONCEPT. USE AT OWN RISK.** 
+> This software is provided "as is" without any guarantees or claims regarding profitability. Automated trading carries significant risk, and using this bot **may result in financial losses**. It is intended to be a foundation for you to adapt and implement your own strategies.
+
 # 🦅 Alpha Yield Bot: Advanced Market Maker & Harvester
 
 The **Alpha Yield Bot** is a high-performance liquidity incentive harvester designed for the Alpha Arcade protocol on Algorand. It operates as a delta-neutral market maker, focusing on capturing the **2.5x Bilateral Bonus** while aggressively managing positions to stay within the "Reward Zone."
@@ -88,6 +94,34 @@ The bot's primary goal is to "flip" inventory back into USDC. It uses a multi-st
     *   **Forced Exit**: Lowers price to `Midpoint - 0.5¢`.
 3.  **Volatility Bypass**: If a sharp price drop is detected (>3¢), the bot skips the windows and immediately lowers the Sell price to exit.
 4.  **Physical Stop-Loss**: If a position loses more than **5¢** in value, the bot triggers a **Market Order Exit** (if data sanity checks pass) to protect principal.
+
+---
+
+## 🧪 Category-Specific Strategy Samples
+
+The bot is designed to be modular. You can easily extend its logic based on the market category (e.g., Crypto, Politics, Sports).
+
+### Example: Crypto Volatility Buffer
+The current implementation includes a sample of how to add sensitivity based on the "Crypto" tag:
+
+```typescript
+// Sample logic from alpha_yield_bot.ts
+const isCrypto = market.categories?.some((c: string) => c.toLowerCase().includes('crypto'));
+const cryptoBoost = isCrypto ? 10000 : 0; // Adds +1.0¢ buffer for crypto
+
+if (isCrypto) { 
+  console.log(`🛡️ [CRYPTO] Volatility Buffer Active (+1.0¢)`); 
+}
+
+// Pass derived buffer to the tick loop
+await tick(..., safetyBuffer + cryptoBoost, ...);
+```
+
+### Adapting for Other Categories
+You can follow this pattern to implement custom logic:
+*   **Sports**: Tighten spreads closer to game time.
+*   **Politics**: Lower exposure during high-impact news cycles.
+*   **Custom**: Use external APIs to feed real-time volatility data into the `tick` function.
 
 ---
 
