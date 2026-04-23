@@ -43,6 +43,8 @@ The system provides a mechanism to reclaim ALGO Minimum Balance (MBR) from unuse
 ### **Phase 1: Initialization & Metadata Discovery**
 - **Action:** Call `getRewardMarkets()` via the Reward SDK.
 - **Source of Truth:** 
+    - **Authority Anchor:** MUST strictly use the `midpoint` field from the **Reward SDK Metadata** (`getRewardMarkets()`). 
+    - **Live Verification:** On startup/tick, the bot must attempt to fetch the live price via `getMarket(slug)`. If the live price differs from metadata by > 0.01¢, the live price MUST take priority to prevent "Phantom Success."
     - Fetch `rewardsMinContracts`: The absolute minimum shares required per order for reward eligibility.
     - Fetch `rewardsSpreadDistance`: The maximum allowable distance from the midpoint to qualify for rewards.
 - **Validation:** If `Wallet_USDC < (MinContracts * 2 * MidPrice)`, exit with `[ERROR] Insufficient USDC for Reward Minimum`.
@@ -50,13 +52,15 @@ The system provides a mechanism to reclaim ALGO Minimum Balance (MBR) from unuse
     - If **imbalanced**, it must trigger **Phase 3 (Hedge)** and **Phase 4 (Merge)** before starting a new cycle.
     - If **balanced and sufficient**, it should skip **Phase 2 (Split)** and go directly to Ask placement.
 
-### **Phase 2: Maker (Ask Placement)**
-- **Target Selection:** MUST strictly use `midpoint` and `rewardsSpreadDistance` from the **Reward SDK Metadata**.
+- **Strategy Selection:**
+    - **Standard Markets:** Use "Edge Farming" (orders at 95% of the spread distance).
+    - **Crypto Markets:** Detected via `categories` metadata. MUST use **"Center Farming"** (orders fixed at 0.5¢ from the midpoint).
 - **Price Calculation:**
-    - `YesPrice = RewardMidpoint + Math.round(RewardsSpread * 0.95)`
-    - `NoPrice = (1,000,000 - RewardMidpoint) + Math.round(RewardsSpread * 0.95)`
+    - `targetSpread = isCrypto ? 0.5¢ : Math.round(RewardsSpread * 0.95)`
+    - `YesPrice = RewardMidpoint + targetSpread`
+    - `NoPrice = (1,000,000 - RewardMidpoint) + targetSpread`
 - **Action:** Use `splitShares` to enter, then place dual Asks (Sell Orders) for the full `targetShares`.
-- **Goal:** Pin orders to the inner edge (95%) of the reward zone to maximize fill probability while ensuring 100% reward eligibility.
+- **Goal:** Maximize "time-in-zone" for volatile crypto assets by using a center anchor while minimizing transaction costs.
 
 ### **Phase 3: The "Ironclad" Hedge (The Trigger)**
 - **Monitoring:** **MUST** use **WebSocket** `order_update` events. Polling is unacceptable for hedging speed.

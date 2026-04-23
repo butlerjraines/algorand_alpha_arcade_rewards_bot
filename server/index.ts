@@ -750,25 +750,28 @@ app.get('/api/ai/recommendations', async (req, res) => {
     const prompt = `You are the Alpha Arcade Strategic Analyst. 
     Analyze these ${detailedMarkets.length} markets for our "Ironclad" Delta-Neutral Market Maker bot.
     
-    STRATEGY CONTEXT:
-    Our bot makes money by providing liquidity on both sides of a market. It performs BEST in "Continuous" markets (like Crypto Price targets) where the price moves gradually. It performs WORST (and loses money) in "Binary" markets (Politics, War, Sudden Events) because a single news event causes the price to gap instantly, leaving the bot with a toxic position.
+    STRATEGIC WEIGHTING (PRIORITIZE THESE):
+    1. TITLE & TIME (THE WINDOW RULE): 
+       - Look for binary outcome language in the title (Will, Is, Winner).
+       - Weight the proximity to the event HEAVILY. 
+       - > 48h to event: Continuous Market (SAFE / RECOMMENDED).
+       - < 12h to event: Step-Function Trap (RISKY / AVOID).
+    2. RULE AUDIT: Check the "rules" field for trigger events that cause price gaps.
     
     YOUR MISSION:
-    1. Read the "rules" (resolution criteria) for each market carefully.
-    2. Identify which markets are truly "Continuous" and which have "Binary" triggers in their rules.
-    3. Pick EXACTLY 4 markets that maximize yield while minimizing "Gap Risk."
-    4. Provide a clear "Exit Strategy" for each (e.g. "Stop 24h before event" or "Stop if BTC volatility exceeds 5%").
+    1. Pick EXACTLY 4 markets that maximize yield while maintaining the "Safe Window."
+    2. For each, identify the "Exact Rule" from your judgment that makes this safe.
     
     MARKETS TO AUDIT:
     ${JSON.stringify(detailedMarkets, null, 2)}
     
     RESPONSE FORMAT:
-    Use <h2> for an Executive Summary. 
-    You MUST provide EXACTLY 4 recommendations. For each one:
+    Use <h2> for an Executive Summary explaining your weighting logic.
+    For each of the 4 recommendations:
     - <h3>ID: [ID] | Title: [Title]</h3>
-    - <p><strong>Market Analysis:</strong> (Nuanced view based on the rules provided)</p>
-    - <p><strong>Strategic Advantage:</strong> (Why this specific market is a top choice right now)</p>
-    - <p><strong>Exit Strategy:</strong> (Specific criteria for when the user should stop the bot)</p>
+    - <p><strong>Exact Rule Applied:</strong> (e.g., "Safe Window: 5 days remaining for news-driven continuous trading")</p>
+    - <p><strong>Strategic Advantage:</strong> (Why this yield vs risk profile is optimal)</p>
+    - <p><strong>Exit Protocol:</strong> (When to pull the bot to avoid the binary gap)</p>
     - <p><strong>Risk Level:</strong> <span class="risk-badge">Low/Med/Trap</span></p>
     - <p><strong>Deployment Command:</strong> <code>npm run bot -- --market [ID] --max</code></p>
     

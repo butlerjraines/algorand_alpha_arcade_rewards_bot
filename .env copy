@@ -1,0 +1,38 @@
+# Alpha SDK Environment Variables
+# Get your API key from the Alpha platform/team
+ALPHA_API_KEY="aa_pk_J7ss6x8CWBTdSHLvuBTgtbz9wGQzMLlUfRA5_o4HR18"
+
+# Your wallet mnemonic (25 words)
+MNEMONIC="fury stomach enlist common network divorce undo spice smoke cabin retire outer rigid later guard smile leopard raw fossil knife salt example winner above update"
+
+
+# Algorand Node Configuration (Nodely defaults)
+ALGOD_SERVER="https://mainnet-api.algonode.cloud"
+ALGOD_PORT="443"
+ALGOD_TOKEN=""
+
+# Algorand Indexer Configuration (Nodely defaults)
+INDEXER_SERVER="https://mainnet-idx.algonode.cloud"
+INDEXER_PORT="443"
+INDEXER_TOKEN=""
+
+# --- Bot Strategy Configuration ---
+# The market you want to provide liquidity for
+TARGET_MARKET_ID=3509483582
+
+# Target order size in USDC (Optional)
+# If removed, bot automatically scales to the protocol's reward minimum.
+# ORDER_SIZE_USDC="20"
+
+# Safety buffer from the midpoint (in cents)
+# 0.5¢ (Aggressive): High rewards, fills very fast. Best for completing sets.
+# 1.5¢ (Balanced): Good rewards, resists market noise/jitter.
+# 2.5¢ (Conservative): Lower rewards, keeps you in the zone longer during volatility.
+SAFETY_BUFFER_CENTS="1.5"
+
+# Loop frequency (seconds)
+TICK_INTERVAL="20"
+
+# Liquidation Profit Window (number of ticks)
+# How many ticks to try and sell at midpoint before aggressive exit.
+LIQUIDATION_WINDOW_TICKS="10"
