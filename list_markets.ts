@@ -24,9 +24,10 @@ async function listMarkets() {
     algodClient,
     indexerClient,
     apiKey: process.env.ALPHA_API_KEY || '',
-    // Use default Mainnet IDs if not specified
     matcherAppId: 3078581851,
     usdcAssetId: 31566704,
+    activeAddress: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ', // Placeholder
+    signer: async (txnGroup) => txnGroup.map(() => new Uint8Array(64)) // Dummy signer for read-only
   });
 
   console.log('Fetching live markets...');
@@ -37,7 +38,7 @@ async function listMarkets() {
     markets.forEach((market, index) => {
       console.log(`${index + 1}. [${market.marketAppId}] ${market.title}`);
       console.log(`   Resolution: ${market.resolutionValue}`);
-      console.log(`   Volume: $${(market.volume / 1e6).toLocaleString()}`);
+      console.log(`   Volume: $${((market.volume || 0) / 1e6).toLocaleString()}`);
       console.log('---');
     });
   } catch (error) {

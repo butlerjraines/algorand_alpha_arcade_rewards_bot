@@ -5,6 +5,9 @@ import algosdk from 'algosdk';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { AlphaClient } from '@alpha-arcade/sdk';
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import axios from 'axios';
+import WebSocket from 'ws';
 // Using built-in fetch (available in Node.js 18+)
 
 const __filename = fileURLToPath(import.meta.url);
@@ -36,6 +39,10 @@ let botFleet: Record<string, any> = {};
 let pendingCommands: Record<string, { command: string, amountUsd?: number }> = {};
 let stopSignals = new Map<number, { clean: boolean }>();
 const historyMidpoints = new Map<number, number>();
+let btcPrice: number | null = null;
+let btcTargetPrice: number | null = null;
+const targetMarketId = process.env.TARGET_MARKET_ID ? parseInt(process.env.TARGET_MARKET_ID) : null;
+const SHUTDOWN_THRESHOLD_PCT = 0.01; // 1% away from strike
 
 // --- Setup Algorand Client ---
 const algodClient = new algosdk.Algodv2(
@@ -88,6 +95,65 @@ function getBotAddress() {
     return account.addr.toString();
   } catch (e) {
     return null;
+  }
+}
+
+async function startBtcStream() {
+  // Use binance.us for US-based IP addresses to avoid 451 error
+  const ws = new WebSocket('wss://stream.binance.us:9443/ws/btcusdt@ticker');
+
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      btcPrice = parseFloat(msg.c); // 'c' is the current/closing price
+
+      // Extract target price from market title if not already done
+      const currentMarket = marketCache.find(m => m.marketAppId === targetMarketId);
+      if (currentMarket && /bitcoin/i.test(currentMarket.title)) {
+        
+        // Extract $ amount from title (e.g., "$80,000")
+        if (!btcTargetPrice) {
+          const match = currentMarket.title.match(/\$([0-9,.]+)/);
+          if (match) {
+            btcTargetPrice = parseFloat(match[1].replace(/,/g, ''));
+            console.log(`[BTC SHIELD] Identified Target Strike: $${btcTargetPrice.toLocaleString()}`);
+          }
+        }
+
+        // Logic for Shutdown Alert
+        if (btcTargetPrice) {
+          const distance = Math.abs(btcPrice - btcTargetPrice) / btcTargetPrice;
+          const isApproaching = btcPrice < btcTargetPrice && distance < SHUTDOWN_THRESHOLD_PCT;
+          
+          if (isApproaching) {
+            console.log(`[!!! SHUTDOWN ALERT !!!] BTC at $${btcPrice.toLocaleString()} is within 1% of $${btcTargetPrice.toLocaleString()} strike!`);
+          } else {
+            // Heartbeat
+            if (Math.random() < 0.05) { // Log occasionally to avoid spamming console
+               console.log(`[BTC STREAM] $${btcPrice.toLocaleString()} | Target: $${btcTargetPrice.toLocaleString()} (${(distance * 100).toFixed(2)}% away)`);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error('WebSocket message error:', err);
+    }
+  });
+
+  ws.on('error', (err) => console.error('Binance WebSocket Error:', err));
+  ws.on('close', () => {
+    console.log('Binance WebSocket closed. Reconnecting...');
+    setTimeout(startBtcStream, 5000);
+  });
+}
+
+// Keep the old updateBtcPrice for fallback/rest of code
+async function updateBtcPrice() {
+  try {
+    const response = await axios.get('https://api.binance.us/api/v3/ticker/price?symbol=BTCUSDT');
+    btcPrice = parseFloat(response.data.price);
+  } catch (error) {
+    console.error('❌ Failed to update BTC price:', error);
   }
 }
 
@@ -167,7 +233,8 @@ async function refreshMarkets() {
        const totalPoolScore = Number(rm.currentMidpointLiquidity || (minContracts * 5));
        const minProjectedShare = (minScore / (totalPoolScore + minScore)) * 100;
        
-       const poolDailyUsdc = ((rm.lastRewardAmount || 0) / 1e6) * 24;
+       // Using totalRewards as the daily pot directly per user instructions
+       const poolDailyUsdc = (rm.totalRewards || 0) / 1e6;
        const minDailyYield = poolDailyUsdc * (minProjectedShare / 100);
 
        // efficiencyScore is now ROI% (Daily Yield / Actual Entry Cost)
@@ -201,6 +268,7 @@ async function refreshMarkets() {
         efficiencyScore: score,
         projectedShare: minProjectedShare,
         estDailyYield: minDailyYield,
+        dailyPot: poolDailyUsdc,
         bilateralEntryCost: bilateralEntryCost,
         safetyGap: (rm.rewardsSpreadDistance || 30000) - 5000,
         isTrap: (rm.rewardsSpreadDistance || 30000) < 10000
@@ -216,8 +284,12 @@ async function refreshMarkets() {
           
           return {
             marketAppId: appId,
-            title: m.title,
+            title: m.title || m.name || `Market ${appId}`,
             volume: Math.floor(Number(m.volume || 0) * 1e6),
+            twentyFourHrVolume: Math.floor(Number(m.twentyFourHrVolume || 0) * 1e6),
+            midpoint: m.midpoint || (rewardInfo ? Number(rewardInfo.midpoint || 0) : 500000),
+            closingTime: m.closingTime || m.closing_time || m.endTs || m.end_ts || (rewardInfo ? rewardInfo.endTs : 0),
+            endTs: m.endTs || m.end_ts || m.closingTime || m.closing_time || (rewardInfo ? rewardInfo.endTs : 0),
             resolutionValue: "Mainnet",
             source: m.source || 'sdk',
             isReward: !!rewardInfo,
@@ -229,13 +301,12 @@ async function refreshMarkets() {
             competitionTag: rewardInfo ? rewardInfo.lpRewardCompetitionTag : 'Normal',
             competitionPercentile: rewardInfo ? rewardInfo.lpRewardCompetitionPercentile : 0,
             competitionWalletCount: rewardInfo && typeof rewardInfo.lpRewardCompetitionWalletCount === 'number' ? rewardInfo.lpRewardCompetitionWalletCount : 0,
-            endTs: m.endTs || (rewardInfo ? rewardInfo.endTs : 0),
             categories: m.categories || [],
             currentMidpointLiquidity: rewardInfo ? Number(rewardInfo.currentMidpointLiquidity || 0) : 0,
-            midpoint: rewardInfo ? Number(rewardInfo.midpoint || 0) : 0,
             // Injected Ranking Stats
             efficiencyScore: rewardInfo ? rewardInfo.efficiencyScore : 0,
             estDailyYield: rewardInfo ? rewardInfo.estDailyYield : 0,
+            dailyPot: rewardInfo ? rewardInfo.dailyPot : 0,
             projectedShare: rewardInfo ? rewardInfo.projectedShare : 0,
             bilateralEntryCost: rewardInfo ? rewardInfo.bilateralEntryCost : 0,
             safetyGap: rewardInfo ? rewardInfo.safetyGap : 0,
@@ -254,8 +325,8 @@ async function refreshMarkets() {
   }
 }
 
-// Initial refresh in background
 refreshMarkets();
+startBtcStream();
 setInterval(refreshMarkets, 2 * 60 * 1000); // Increased frequency: 2m
 
 // --- API Endpoints ---
@@ -271,6 +342,7 @@ app.get('/api/bot/config', (req, res) => {
 
 app.post('/api/bot/heartbeat', async (req, res) => {
   const { marketId, status, name, size, yesTotalZone, noTotalZone, yesMySize, noMySize, yesTotalScore, noTotalScore, yesMyScore, noMyScore, cashStatus, nav, activity, botId: incomingBotId } = req.body;
+  console.log(`💓 [HEARTBEAT] Received from bot ${incomingBotId} for market ${marketId}`);
   
   // 1. UNIQUE IDENTIFICATION: Priority to the bot's self-generated unique ID
   const botId = incomingBotId || `${marketId}-${name}`;
@@ -387,7 +459,8 @@ app.post('/api/bot/heartbeat', async (req, res) => {
     ...pulse, 
     poolPercentage,
     yesShare,
-    noShare
+    noShare,
+    btcPrice
   });
 });
 
@@ -628,11 +701,88 @@ app.get('/api/markets', async (req, res) => {
     console.log(`🔄 ${isStale ? 'Auto-refreshing stale' : 'Forced'} market data...`);
     refreshMarkets(); // Trigger in background
   }
-  res.json({ 
-    markets: marketCache, 
+  res.json({
+    status: 'active',
     lastRefresh: lastRefreshTs,
+    btcPrice,
+    btcTargetPrice,
+    botFleet,
+    pendingCommands,
+    markets: marketCache, 
     isRefreshing
   });
+});
+
+app.get('/api/ai/recommendations', async (req, res) => {
+  if (!process.env.GOOGLE) {
+    return res.status(500).json({ error: 'AI not configured. Missing GOOGLE API key in .env' });
+  }
+
+  try {
+    const genAI = new GoogleGenerativeAI(process.env.GOOGLE);
+    // Using gemini-2.5-flash-lite which is available and efficient on free tier
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
+
+    // Pass the raw market data and let the AI do the heavy lifting
+    // DEEP AUDIT: Fetch full descriptions for top candidates to reveal "Binary Trap" nuances
+    const detailedMarkets = await Promise.all(
+      marketCache
+        .filter(m => m.isReward && !m.isTrap)
+        .sort((a, b) => (b.estDailyYield || 0) - (a.estDailyYield || 0))
+        .slice(0, 15)
+        .map(async (m) => {
+          try {
+            const full = await alphaClient.getMarket(m.marketAppId.toString());
+            return {
+              id: m.marketAppId,
+              title: m.title,
+              rules: full?.rules || full?.description || 'N/A',
+              volume: `$${(m.volume / 1e6).toLocaleString()}`,
+              yield: m.estDailyYield,
+              safetyGap: m.safetyGap
+            };
+          } catch (e) {
+            return { id: m.marketAppId, title: m.title, yield: m.estDailyYield };
+          }
+        })
+    );
+
+    const prompt = `You are the Alpha Arcade Strategic Analyst. 
+    Analyze these ${detailedMarkets.length} markets for our "Ironclad" Delta-Neutral Market Maker bot.
+    
+    STRATEGY CONTEXT:
+    Our bot makes money by providing liquidity on both sides of a market. It performs BEST in "Continuous" markets (like Crypto Price targets) where the price moves gradually. It performs WORST (and loses money) in "Binary" markets (Politics, War, Sudden Events) because a single news event causes the price to gap instantly, leaving the bot with a toxic position.
+    
+    YOUR MISSION:
+    1. Read the "rules" (resolution criteria) for each market carefully.
+    2. Identify which markets are truly "Continuous" and which have "Binary" triggers in their rules.
+    3. Pick EXACTLY 4 markets that maximize yield while minimizing "Gap Risk."
+    4. Provide a clear "Exit Strategy" for each (e.g. "Stop 24h before event" or "Stop if BTC volatility exceeds 5%").
+    
+    MARKETS TO AUDIT:
+    ${JSON.stringify(detailedMarkets, null, 2)}
+    
+    RESPONSE FORMAT:
+    Use <h2> for an Executive Summary. 
+    You MUST provide EXACTLY 4 recommendations. For each one:
+    - <h3>ID: [ID] | Title: [Title]</h3>
+    - <p><strong>Market Analysis:</strong> (Nuanced view based on the rules provided)</p>
+    - <p><strong>Strategic Advantage:</strong> (Why this specific market is a top choice right now)</p>
+    - <p><strong>Exit Strategy:</strong> (Specific criteria for when the user should stop the bot)</p>
+    - <p><strong>Risk Level:</strong> <span class="risk-badge">Low/Med/Trap</span></p>
+    - <p><strong>Deployment Command:</strong> <code>npm run bot -- --market [ID] --max</code></p>
+    
+    End with an <h2>Analyst Warning</h2> regarding current market volatility. Respond in clean HTML fragments only.`;
+    
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
+
+    res.json({ recommendations: text });
+  } catch (error: any) {
+    console.error('AI Analysis Error:', error);
+    res.status(500).json({ error: 'AI Analysis failed', details: error.message });
+  }
 });
 
 app.post('/api/bot/stop', (req, res) => {
@@ -642,6 +792,101 @@ app.post('/api/bot/stop', (req, res) => {
   console.log(`🛑 Received shutdown signal for market ${marketId} (Clean: ${clean})`);
   stopSignals.set(Number(marketId), { clean: !!clean });
   res.json({ success: true, message: 'Shutdown signal queued' });
+});
+
+app.post('/api/bot/cleanup', async (req, res) => {
+  const address = getBotAddress();
+  if (!address || !alphaClient) return res.status(500).json({ error: 'AlphaClient not initialized' });
+
+  try {
+    console.log(`🧹 [CLEANUP] Request received for ${address}`);
+    const accountInfo = await algodClient.accountInformation(address).do();
+    const assets = accountInfo.assets || [];
+    
+    // --- DYNAMIC PROTECTION SHIELD ---
+    // 1. Protect USDC (Always)
+    const protectedAssets = new Set([31566704]);
+    
+    // 2. Identify all unique active Market IDs (from Fleet + Open Orders)
+    const activeMarketIds = new Set<number>();
+    
+    // From Fleet
+    for (const bot of Object.values(botFleet)) {
+      if (bot.marketId) activeMarketIds.add(Number(bot.marketId));
+    }
+
+    // From Open Orders
+    try {
+      const orders = await alphaClient.getWalletOrdersFromApi(address);
+      orders.forEach(o => {
+        if (o.marketAppId) activeMarketIds.add(Number(o.marketAppId));
+      });
+    } catch (e) {
+      console.error("❌ Failed to fetch open orders during cleanup. Aborting for safety.");
+      return res.status(500).json({ error: 'Safety Check Failed: Could not verify open orders.' });
+    }
+
+    // 3. Protect all assets associated with those markets
+    for (const mId of activeMarketIds) {
+      try {
+        const m = await alphaClient.getMarket(mId.toString());
+        if (m) {
+          if (m.yesAssetId) protectedAssets.add(Number(m.yesAssetId));
+          if (m.noAssetId) protectedAssets.add(Number(m.noAssetId));
+        }
+      } catch (e) {
+        console.warn(`⚠️ Could not fetch market metadata for market ${mId}, skipping protection for its assets.`);
+      }
+    }
+
+    console.log(`🛡️ [PROTECTION] Shielding ${protectedAssets.size} active assets (from ${activeMarketIds.size} markets) from cleanup.`);
+
+    const toClear = assets.filter((a: any) => {
+      const id = Number((a as any).assetId ?? (a as any)['asset-id']);
+      const amount = Number(a.amount);
+      return amount === 0 && !protectedAssets.has(id);
+    });
+
+    if (toClear.length === 0) {
+      return res.json({ success: true, count: 0, message: 'Wallet is already clean!' });
+    }
+
+    // --- DRY RUN MODE ---
+    if (req.query.dryRun === 'true') {
+      return res.json({ 
+        success: true, 
+        dryRun: true,
+        count: toClear.length, 
+        estimatedReclaim: toClear.length * 0.1,
+        message: `Found ${toClear.length} unused assets. Reclaiming this would unlock ~${(toClear.length * 0.1).toFixed(1)} ALGO.` 
+      });
+    }
+
+    const params = await algodClient.getTransactionParams().do();
+    const mnemonic = process.env.MNEMONIC!;
+    const account = algosdk.mnemonicToSecretKey(mnemonic);
+    let cleared = 0;
+
+    for (const a of toClear) {
+      const id = Number((a as any).assetId ?? (a as any)['asset-id']);
+      const txn = algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
+        sender: address,
+        receiver: address,
+        closeRemainderTo: DEFAULT_MARKET_CREATOR_ADDRESS,
+        assetIndex: id,
+        amount: 0,
+        suggestedParams: params
+      });
+      const signed = txn.signTxn(account.sk);
+      await algodClient.sendRawTransaction(signed).do();
+      cleared++;
+    }
+
+    res.json({ success: true, count: cleared, message: `Cleared ${cleared} unused ASAs.` });
+  } catch (error: any) {
+    console.error('❌ Cleanup failed:', error);
+    res.status(500).json({ error: 'Cleanup failed', details: error.message });
+  }
 });
 
 app.listen(port, () => {

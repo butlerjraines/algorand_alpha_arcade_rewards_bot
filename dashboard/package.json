@@ -12,6 +12,7 @@
   "dependencies": {
     "@algorandfoundation/algokit-utils": "^9.2.0",
     "@perawallet/connect": "^1.5.2",
+    "@tailwindcss/typography": "^0.5.19",
     "@tailwindcss/vite": "^4.2.2",
     "@tanstack/react-query": "^5.99.0",
     "@txnlab/use-wallet": "^4.6.0",
@@ -23,6 +24,7 @@
     "lute-connect": "^1.7.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
+    "react-markdown": "^10.1.0",
     "tailwindcss": "^4.0.0"
   },
   "devDependencies": {

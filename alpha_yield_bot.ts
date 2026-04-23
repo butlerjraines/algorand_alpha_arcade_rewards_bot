@@ -1,48 +1,96 @@
 import dotenv from 'dotenv';
 import algosdk from 'algosdk';
-import { AlphaClient } from '@alpha-arcade/sdk';
+import { AlphaClient, AlphaWebSocket } from '@alpha-arcade/sdk';
 
 dotenv.config();
 
 /**
- * ALPHA YIELD BOT - AGGRESSIVE HARVESTER WITH FLEET TELEMETRY
+ * ALPHA ARCADE REWARDS BOT (IRONCLAD DELTA-NEUTRAL)
+ * Strictly follows docs/technical_spec.md
  */
 
 // --- CLI Argument Parsing ---
-const marketArgIdx = process.argv.indexOf('--market');
-const cliMarketId = marketArgIdx !== -1 ? parseInt(process.argv[marketArgIdx + 1]) : null;
-const isShutdownMode = process.argv.includes('--shutdown');
-const targetArgIdx = process.argv.indexOf('--target');
-const cliTargetShares = targetArgIdx !== -1 ? parseFloat(process.argv[targetArgIdx + 1]) : null;
+const marketFlagIdx = process.argv.indexOf('--market');
+const marketArg = (marketFlagIdx !== -1) ? process.argv[marketFlagIdx + 1] : (process.argv[2] && !process.argv[2].startsWith('--') ? process.argv[2] : null);
 const useMax = process.argv.includes('--max');
-const nameArgIdx = process.argv.indexOf('--name');
-const cliBotName = nameArgIdx !== -1 ? process.argv[nameArgIdx + 1] : null;
-const bufferArgIdx = process.argv.indexOf('--buffer');
-const cliBufferCents = bufferArgIdx !== -1
-  ? parseFloat(process.argv[bufferArgIdx + 1])
-  : (process.env.SAFETY_BUFFER_CENTS ? parseFloat(process.env.SAFETY_BUFFER_CENTS) : 1.5);
+const injectArgIdx = process.argv.indexOf('--inject');
+const injectAmount = injectArgIdx !== -1 ? parseFloat(process.argv[injectArgIdx + 1]) : null;
 
-const botName = cliBotName || 'Alpha-Yield';
-let botId = ''; // Finalized in main()
+const activeMarketId = marketArg ? parseInt(marketArg) : parseInt(process.env.TARGET_MARKET_ID || '0');
 
-async function sendHeartbeat(botId: string, marketId: number, statusParam: string | any = 'online', activityParam: string = 'Ticking...') {
+if (!activeMarketId) {
+  console.error('❌ Usage: npm run bot <MARKET_ID> [--max] [--inject <AMOUNT>]');
+  process.exit(1);
+}
+
+// --- Risk Constants ---
+const USDC_BUFFER_PERCENT = parseFloat(process.env.USDC_BUFFER_PERCENT || '0.015');
+const MAX_SLIPPAGE_TOLERANCE = parseFloat(process.env.MAX_SLIPPAGE_TOLERANCE || '0.02');
+const DUST_THRESHOLD = parseFloat(process.env.DUST_THRESHOLD || '0.1') * 1e6;
+
+// --- Global State ---
+let botId = `Ironclad-${activeMarketId}`;
+let currentPhase = 'INIT';
+let targetShares = 0;
+let isProcessingFill = false;
+let isShuttingDown = false;
+let marketEndTs = 0;
+let rewardsMidpoint = 500_000;
+let rewardsSpread = 100_000;
+let isBtcMarket = false;
+let currentBtcPrice = 0;
+let tickCount = 0;
+
+let globalClient: AlphaClient;
+let globalAlgod: algosdk.Algodv2;
+let globalAddress: string;
+
+async function sendHeartbeat(payload: any) {
+  tickCount++;
+  const mid = (rewardsMidpoint / 10000).toFixed(1);
+  const spr = (rewardsSpread / 10000).toFixed(1);
+  const btcInfo = isBtcMarket && currentBtcPrice > 0 ? ` | BTC: $${currentBtcPrice.toLocaleString()}` : '';
+  
+  const statusMsg = isProcessingFill ? 'Processing Fill/Hedge' : 
+                   isShuttingDown ? 'Shutting Down' : 
+                   currentPhase === 'MAKER' ? 'Monitoring Reward Zone' : 
+                   `Running ${currentPhase} Phase`;
+
+  console.log(`⏱️ [TICK ${tickCount}] ${statusMsg}${btcInfo} | Mid: ${mid}¢ | Zone: ±${spr}¢ | Capital: $${(payload.size || 0).toFixed(2)}`);
   try {
-    let payload: any = { botId, marketId, status: 'online', name: botId, activity: 'Ticking...' };
-
-    if (typeof statusParam === 'object') {
-      payload = { ...payload, ...statusParam };
-    } else {
-      payload.status = statusParam;
-      payload.activity = activityParam;
-    }
-
     const resp = await fetch('http://localhost:3001/api/bot/heartbeat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
+      body: JSON.stringify({
+        botId,
+        marketId: activeMarketId,
+        name: botId,
+        status: 'online',
+        phase: currentPhase,
+        ...payload
+      })
     });
-    if (resp.ok) return await resp.json();
-  } catch (e) { }
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.btcPrice) currentBtcPrice = data.btcPrice;
+      return data;
+    } else {
+      console.log(`⚠️ [HEARTBEAT] Server error: ${resp.status}`);
+    }
+  } catch (e: any) { 
+    console.log(`⚠️ [HEARTBEAT] Connection failed: ${e.message}`);
+  }
+
+  // Standalone Fallback: If server is down, fetch directly if it's a BTC market
+  if (isBtcMarket) {
+    try {
+      const btcResp = await fetch('https://api.binance.us/api/v3/ticker/price?symbol=BTCUSDT');
+      if (btcResp.ok) {
+        const btcData = await btcResp.json() as any;
+        currentBtcPrice = parseFloat(btcData.price);
+      }
+    } catch (e) { }
+  }
   return null;
 }
 
@@ -53,6 +101,7 @@ async function main() {
   }
 
   const account = algosdk.mnemonicToSecretKey(process.env.MNEMONIC);
+  const address = account.addr.toString();
   const algodClient = new algosdk.Algodv2('', process.env.ALGOD_SERVER || 'https://mainnet-api.algonode.cloud', '443');
   const indexerClient = new algosdk.Indexer('', process.env.INDEXER_SERVER || 'https://mainnet-idx.algonode.cloud', '443');
 
@@ -60,424 +109,354 @@ async function main() {
     algodClient,
     indexerClient,
     signer: algosdk.makeBasicAccountTransactionSigner(account),
-    activeAddress: account.addr.toString(),
+    activeAddress: address,
     apiKey: process.env.ALPHA_API_KEY,
     matcherAppId: 3078581851,
     usdcAssetId: 31566704,
   });
 
-  const marketId = cliMarketId || parseInt(process.env.TARGET_MARKET_ID || '0');
-  let targetShares = cliTargetShares || (process.env.ORDER_SIZE_USDC ? parseFloat(process.env.ORDER_SIZE_USDC) : 0);
-  botId = process.env.BOT_ID ? `${process.env.BOT_ID}-${marketId}` : `${botName}-${marketId}`;
+  globalClient = alphaClient;
+  globalAlgod = algodClient;
+  globalAddress = address;
 
-  await sendHeartbeat(botId, marketId, 'online', 'Bot Initializing...');
-  const safetyBuffer = Math.round(cliBufferCents * 10000);
-  const tickInterval = parseInt(process.env.TICK_INTERVAL || '30') * 1000;
-  const liquidationWindow = parseInt(process.env.LIQUIDATION_WINDOW_TICKS || '2');
-  const inventoryTicks = { YES: 0, NO: 0 };
-  const entryMidpoints = { YES: 0, NO: 0 };
-  const zeroInvTicks = { YES: 0, NO: 0 }; // Stability latch for indexer lag
-  let lastMidpoint = 0;
-  let cooldownTicks = 0;
+  console.log(`\n🦅 [${botId}] Booting Ironclad Strategy...`);
 
-  console.log(`\n🚀 [${botId}] active for Market ${marketId}`);
+  // --- Safety Check: ALGO for Gas ---
+  const accountInfo = await algodClient.accountInformation(address).do();
+  const algoBalance = Number(accountInfo.amount) / 1e6;
+  if (algoBalance < 10) {
+    console.error(`❌ [ERROR] Insufficient ALGO. Current: ${algoBalance.toFixed(2)}. Please have at least 10 ALGO for gas and fees.`);
+    process.exit(1);
+  }
 
-  let isShuttingDown = false;
-  const cleanup = async (shouldClean: boolean) => {
-    if (isShuttingDown) return;
-    isShuttingDown = true;
-    if (shouldClean) {
-      console.log(`\n[SHUTDOWN] Clearing all orders for Market ${marketId}...`);
-      try {
-        const allOrders = await alphaClient.getWalletOrdersFromApi(account.addr.toString());
-        const toCancel = allOrders.filter(o => Number(o.marketAppId) === Number(marketId));
-        for (const order of toCancel) {
-          await alphaClient.cancelOrder({ marketAppId: order.marketAppId, escrowAppId: order.escrowAppId, orderOwner: account.addr.toString() }).catch(() => { });
-        }
-      } catch (err) { }
+  // --- Phase 1: Metadata Discovery ---
+  currentPhase = 'DISCOVERY';
+  const rewardMarkets = await alphaClient.getRewardMarkets() as any[];
+  const market = rewardMarkets.find((m: any) => m.marketAppId === activeMarketId);
+
+  if (!market) {
+    console.error(`❌ [ERROR] Market ${activeMarketId} not found in reward markets.`);
+    process.exit(1);
+  }
+
+  const rewardsMinContracts = Number(market.rewardsMinContracts || 100_000_000);
+  rewardsSpread = Number(market.rewardsSpreadDistance || 100_000);
+  rewardsMidpoint = Number(market.midpoint || 500_000);
+  marketEndTs = Number(market.endTs || 0);
+  const title = market.title || activeMarketId.toString();
+  isBtcMarket = /btc|bitcoin/i.test(title);
+  
+  // Normalize seconds to milliseconds if needed
+  if (marketEndTs > 0 && marketEndTs < 10000000000) {
+    marketEndTs *= 1000;
+  }
+  console.log(`[DISCOVERY] Market: ${market.title || activeMarketId}`);
+  console.log(`[DISCOVERY] Min Size: ${(rewardsMinContracts / 1e6).toFixed(0)} | Max Spread: ${(rewardsSpread / 10000).toFixed(1)}¢`);
+  if (marketEndTs > 0) {
+    console.log(`[DISCOVERY] Market Ends: ${new Date(marketEndTs).toLocaleString()}`);
+  }
+
+  // --- Initial Cleanup & Sizing ---
+  await cancelAllOrders(alphaClient, address, activeMarketId);
+  const initialPos = await alphaClient.getPositions(address);
+  const mPos = initialPos.find(p => p.marketAppId === activeMarketId);
+  if (mPos) {
+    const matched = Math.min(mPos.yesBalance, mPos.noBalance);
+    if (matched > DUST_THRESHOLD) {
+      console.log(`[INIT] Merging existing balanced position: ${(matched / 1e6).toFixed(1)} pairs...`);
+      await alphaClient.mergeShares({ marketAppId: activeMarketId, amount: matched }).catch(() => { });
     }
-    await sendHeartbeat(botId, marketId, 'offline', shouldClean ? 'Shut down (Cleaned)' : 'Shut down (Saved)');
-    console.log(`[SHUTDOWN] Done. Goodbye!`);
-    process.exit(0);
-  };
+  }
 
-  process.on('SIGINT', () => cleanup(false));
+  targetShares = await calculateTargetSize(algodClient, address, rewardsMinContracts);
+  console.log(`[SYSTEM] Initial Target Size: ${(targetShares / 1e6).toFixed(2)} USDC per side.`);
 
-  async function runLoop() {
-    if (isShuttingDown) return;
+  // --- WebSocket Activation ---
+  const ws = new AlphaWebSocket();
+  ws.subscribeWalletOrders(address, async (event: any) => {
+    if (isProcessingFill || isShuttingDown) return;
+
+    // Filter for fills on our SELL orders
+    const fill = event.orders?.find((o: any) =>
+      Number(o.marketAppId) === activeMarketId &&
+      (o.status === 'PARTIAL' || o.status === 'FILLED') &&
+      o.quantityFilled > 0 &&
+      !o.isBuying
+    );
+
+    if (fill) {
+      await handleFill(fill.quantityFilled);
+    }
+  });
+
+  // --- Drift & Expiry Monitor & Heartbeat ---
+  const monitor = async () => {
+    if (isProcessingFill || isShuttingDown) return;
+
+    // Heartbeat (always send even if not in MAKER phase)
+    const hbData = await sendHeartbeat({
+      activity: `Phase: ${currentPhase}`,
+      size: targetShares / 1e6
+    });
+
+    if (hbData?.command) {
+      const cmd = hbData.command;
+      if (cmd === 'STOP_CLEAN') {
+        console.log(`📡 [REMOTE] Received STOP_CLEAN signal.`);
+        await cleanup(globalClient, globalAddress, true);
+        return;
+      }
+      if (cmd === 'STOP_KEEP') {
+        console.log(`📡 [REMOTE] Received STOP_KEEP signal.`);
+        await cleanup(globalClient, globalAddress, false);
+        return;
+      }
+      if (cmd === 'inject' || cmd === 'ADDBUDGET' || cmd === 'add-budget') {
+        const amt = hbData.amountUsd || 0;
+        console.log(`📡 [REMOTE] Injecting $${amt} additional budget.`);
+        targetShares += (amt * 1e6);
+        // Trigger a refresh if in MAKER phase to deploy new capital
+        if (currentPhase === 'MAKER') await startCycle();
+      }
+    }
+
+    // Check Market Expiry (1 hour before end)
+    if (marketEndTs > 0 && Date.now() > (marketEndTs - 3600000)) {
+      console.log(`\n🚨 [TERMINATE] Market nearing resolution (within 1hr). Triggering graceful exit...`);
+      await cleanup(alphaClient, address, true);
+      return;
+    }
+
+    if (currentPhase !== 'MAKER') return;
+
     try {
-      // 1. Fetch State
-      const [rewardMarkets, accountInfo] = await Promise.all([
-        alphaClient.getRewardMarkets(),
-        algodClient.accountInformation(account.addr.toString()).do()
-      ]);
-      const market = rewardMarkets.find((m: any) => m.marketAppId === marketId);
-      const usdcAsset = accountInfo.assets?.find((a: any) => Number(a.assetId ?? a['asset-id']) === 31566704);
-      const walletUsdc = Number(usdcAsset ? usdcAsset.amount : 0) / 1e6;
-
-      // Log Mode if --max is active
-      if (useMax) {
-        console.log(`📈 [MODE] Max Deployment Pattern Active (Targeting 90% Liquidity)`);
+      // Refresh Reward Metadata
+      const rewardMarkets = await alphaClient.getRewardMarkets() as any[];
+      const m = rewardMarkets.find((rm: any) => rm.marketAppId === activeMarketId);
+      if (m) {
+        const newMid = Number(m.midpoint || 500_000);
+        const newSpr = Number(m.rewardsSpreadDistance || 100_000);
+        if (newMid !== rewardsMidpoint || newSpr !== rewardsSpread) {
+          console.log(`📡 [METADATA SHIFT] Mid: ${(newMid / 10000).toFixed(1)}¢ | Spr: ±${(newSpr / 10000).toFixed(1)}¢`);
+          rewardsMidpoint = newMid;
+          rewardsSpread = newSpr;
+        }
       }
 
-      // 2. Calculate Effective Target (higher of Injection, CLI, or Protocol Min)
-      const minRequiredShares = (Number(market?.rewardsMinContracts || 100_000_000) / 1e6) + 0.01; // +0.01 to ensure strictly above platform floor
-      let effectiveTarget = targetShares;
-      if (useMax) {
-        effectiveTarget = (walletUsdc * 0.9);
-      } else if (!cliTargetShares && effectiveTarget < minRequiredShares) {
-        effectiveTarget = minRequiredShares;
-      }
+      const currentMarket = await alphaClient.getMarket(activeMarketId.toString());
+      if (!currentMarket) return;
 
-      // 3. Telemetry and Commands
-      const stats = await getTickStats(alphaClient, algodClient, account.addr.toString(), marketId, effectiveTarget, rewardMarkets);
-      const signal: any = await sendHeartbeat(botId, marketId, stats);
+      const orders = await alphaClient.getWalletOrdersFromApi(address);
+      const mOrders = orders.filter(o => Number(o.marketAppId) === activeMarketId);
 
-      if (signal && signal.command) {
-        if (signal.command === 'STOP_CLEAN' || signal.command === 'STOP') { await cleanup(true); return; }
-        if (signal.command === 'STOP_KEEP') { await cleanup(false); return; }
-        if (signal.command === 'add-budget') {
-          const amount = Number(signal.amountUsd);
-          if (!isNaN(amount) && amount > 0) {
-            targetShares += amount;
-            console.log(`\n💰 [INJECTION] Added $${amount} to budget. New target: ${targetShares}`);
+      if (mOrders.length > 0) {
+        let needsRefresh = false;
+        for (const order of mOrders) {
+          const sideMid = order.position === 1 ? rewardsMidpoint : (1000000 - rewardsMidpoint);
+          if (Math.abs(Number(order.price) - sideMid) > rewardsSpread) {
+            console.log(`📡 [DRIFT] Order out of reward zone. Refreshing...`);
+            needsRefresh = true;
+            break;
           }
         }
-      }
 
-      if (!market) {
-        console.log(`[${new Date().toLocaleTimeString()}] Waiting for Market ${marketId} data...`);
-        setTimeout(runLoop, 5000);
-        return;
-      }
-
-      console.log(`[${new Date().toLocaleTimeString()}] Ticking for ${botId}...`);
-
-      const isCrypto = market.categories?.some((c: string) => c.toLowerCase().includes('crypto'));
-      const cryptoBoost = isCrypto ? 10000 : 0;
-      if (isCrypto) { console.log(`🛡️  [CRYPTO] Volatility Buffer Active (+1.0¢)`); }
-
-      const tickResult = await tick(alphaClient, algodClient, account.addr.toString(), marketId, effectiveTarget, safetyBuffer + cryptoBoost, inventoryTicks, zeroInvTicks, liquidationWindow, entryMidpoints, lastMidpoint, cooldownTicks, rewardMarkets);
-      if (tickResult) {
-        lastMidpoint = tickResult.midpoint;
-        cooldownTicks = tickResult.cooldownTicks;
-      }
-    } catch (e: any) {
-      console.error('❌ Tick Error:', e.message || e);
-    }
-    setTimeout(runLoop, tickInterval);
-  }
-
-  runLoop();
-}
-
-async function tick(
-  client: AlphaClient,
-  algodClient: algosdk.Algodv2,
-  address: string,
-  marketId: number,
-  targetShares: number,
-  buffer: number,
-  inventoryTicks: { YES: number, NO: number },
-  zeroInvTicks: { YES: number, NO: number },
-  liquidationWindow: number,
-  entryMidpoints: { YES: number, NO: number },
-  lastMidpoint: number,
-  cooldownTicks: number,
-  rewardMarkets: any[]
-) {
-  if (marketId === 0) return { midpoint: lastMidpoint, cooldownTicks };
-
-  const market = rewardMarkets.find((m: any) => m.marketAppId === marketId);
-  if (!market) return { midpoint: lastMidpoint, cooldownTicks };
-
-  const targetQty = Math.round(targetShares * 1e6);
-
-  const [positions, accountInfo, bookSnapshot] = await Promise.all([
-    client.getPositions(address),
-    algodClient.accountInformation(address).do(),
-    client.getFullOrderbookFromApi(market.id)
-  ]);
-
-  const usdcAssetId = 31566704;
-  const usdcAsset = accountInfo.assets?.find((a: any) => Number(a.assetId ?? a['asset-id']) === usdcAssetId);
-  const walletUsdc = Number(usdcAsset ? usdcAsset.amount : 0) / 1e6;
-
-  // Live Midpoint: Fallback to API, but use aggregated bids/asks if available
-  let midpoint = Number(market.midpoint || 500_000);
-  const marketBook = bookSnapshot[marketId.toString()];
-
-  if (marketBook?.bids?.[0] && marketBook?.asks?.[0]) {
-    const bestBid = marketBook.bids[0].price; // e.g., 61.0
-    const bestAsk = marketBook.asks[0].price; // e.g., 68.0
-    const liveMid = Math.round(((bestBid + bestAsk) / 2) * 10000); // Convert to microunits (e.g., 645,000)
-
-    if (Math.abs(liveMid - midpoint) > 5000) {
-      console.log(`📡 [PRICE] Live Sync: ${(liveMid / 1e6).toFixed(3)} | API Lag: ${(midpoint / 1e6).toFixed(3)} (Diff: ${((liveMid - midpoint) / 10000).toFixed(1)}¢)`);
-    }
-    midpoint = liveMid;
-  } else {
-    // Fallback to yesProb if orderbook calculation fails
-    const yesProb = Number(market.yesProb ? market.yesProb * 1e6 : midpoint);
-    if (Math.abs(yesProb - midpoint) > 20000) {
-      console.log(`📡 [PRICE] Using Probability: ${(yesProb / 1e6).toFixed(3)} (API Midpoint seems stale)`);
-      midpoint = yesProb;
-    }
-  }
-  const maxSpread = Number(market.rewardsMaxSpread || 100_000);
-
-  // Volatility Pause: If midpoint shifts > 3% (30k) in one tick
-  let currentCooldown = cooldownTicks;
-  if (lastMidpoint > 0 && Math.abs(midpoint - lastMidpoint) > 30000) {
-    console.log(`⚠️ [VOLATILITY] Market move > 3%. Entering 2-tick cooldown to avoid toxic flow.`);
-    currentCooldown = 2;
-  }
-  if (currentCooldown > 0) {
-    console.log(`⏳ [COOLDOWN] Pausing Bids... (${currentCooldown} ticks remaining)`);
-    currentCooldown--;
-  }
-
-  // Dynamic Spread Protection: Ensure user buffer is within the platform max reward spread
-  const effectiveBuffer = Math.min(buffer, Math.round(maxSpread * 0.9));
-  if (effectiveBuffer < buffer) {
-    console.log(`📡 [SENSITIVITY] Reward Zone narrowed to ±${(maxSpread / 10000).toFixed(1)}¢. Clamping buffer to ${(effectiveBuffer / 10000).toFixed(1)}¢.`);
-  }
-  const openOrders = await client.getWalletOrdersFromApi(address);
-  const marketOrders = openOrders.filter(o => Number(o.marketAppId) === Number(marketId));
-  const mPos = positions.find(p => p.marketAppId === marketId);
-  const yesInv = (mPos?.yesBalance || 0);
-  const noInv = (mPos?.noBalance || 0);
-  const totalRealizedExposure = yesInv + noInv;
-
-  const pendingYesBids = marketOrders.filter(o => o.position === 1 && o.side === 1);
-  const pendingNoBids = marketOrders.filter(o => o.position === 0 && o.side === 1);
-  const totalPendingExposure = pendingYesBids.reduce((s, o) => s + (o.quantity || 0), 0) + pendingNoBids.reduce((s, o) => s + (o.quantity || 0), 0);
-  const isHoldingYes = (yesInv > 100000) || (pendingYesBids.length > 0);
-  const isHoldingNo = (noInv > 100000) || (pendingNoBids.length > 0);
-
-  const marketName = market.title || market.name || market.marketName || `Market ${marketId}`;
-  const yesPending = pendingYesBids.reduce((s, o) => s + (o.quantity || 0), 0) / 1e6;
-  const noPending = pendingNoBids.reduce((s, o) => s + (o.quantity || 0), 0) / 1e6;
-
-  console.log(`[STATUS] ${marketName} (${marketId}) | Target: ${(targetQty / 1e6).toFixed(2)} | Mid: ${(midpoint / 1e6).toFixed(3)} | Budget: $${walletUsdc.toFixed(2)}`);
-  console.log(`[COMMIT] YES: ${(yesInv / 1e6).toFixed(1)}+(P:${yesPending.toFixed(1)}) | NO: ${(noInv / 1e6).toFixed(1)}+(P:${noPending.toFixed(1)})`);
-
-  // --- 1. Budget Management ---
-  const currentBidOrders = marketOrders.filter(o => o.side === 1);
-  const existingBidUsdc = currentBidOrders.reduce((sum, o) => sum + (o.quantity * o.price) / 1e12, 0);
-  const totalSpendableUsdc = walletUsdc + existingBidUsdc;
-  const budgetTracker = { remaining: totalSpendableUsdc };
-
-  // --- 2. Dynamic Target Logic ---
-
-  async function maintainBid(side: 'YES' | 'NO', price: number, currentInv: number) {
-    const posId = side === 'YES' ? 1 : 0;
-    const existing = marketOrders.find(o => o.position === posId && o.side === 1);
-
-    // 1. Exposure Check: Avoid over-buying this specific side
-    const sidePendingBids = side === 'YES' ? pendingYesBids : pendingNoBids;
-    const sideCommitment = currentInv + sidePendingBids.reduce((s, o) => s + (o.quantity || 0), 0);
-
-    if (sideCommitment >= targetQty && !existing) {
-      return;
-    }
-
-    const priceUsdc = price / 1e6;
-    const idealNeeded = Math.max(0, targetQty - currentInv);
-
-    if (idealNeeded < 100000) {
-      console.log(`[SKIP] ${side} Bid: Target reached (Existing: ${(currentInv / 1e6).toFixed(1)})`);
-      // Entry midpoint is managed by maintainAsk — only reset when inventory is truly zero
-      if (existing) await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => { });
-      return;
-    }
-
-    if (currentCooldown > 0) return; // Skip Bidding during volatility cooldown
-
-    // Inventory Skewing: If already heavy, lower the bid to avoid catching the falling knife
-    let effectivePrice = price;
-    if (currentInv > (targetQty * 0.5)) {
-      const skew = Math.round(maxSpread * 0.2); // Low-ball by 20% of max spread
-      effectivePrice -= skew;
-      console.log(`🛡️ [SKEW] ${side} Inventory at ${(currentInv / targetQty * 100).toFixed(0)}%. Lowering bid price by ${(skew / 10000).toFixed(1)}¢.`);
-    }
-
-    const MARGIN_FACTOR = 1.04; // Reserved for matcher commission/escrow
-    const costOfIdeal = ((idealNeeded * priceUsdc) / 1e6) * MARGIN_FACTOR;
-    let needed = idealNeeded;
-    let isPartial = false;
-    if (costOfIdeal > budgetTracker.remaining) {
-      needed = Math.floor((budgetTracker.remaining * 1e12) / (effectivePrice * MARGIN_FACTOR));
-      isPartial = true;
-    }
-
-    if (needed < 100000) {
-      if (existing) await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => { });
-      return;
-    }
-
-    if (existing && Math.abs(existing.price - effectivePrice) <= 2000) {
-      const qtyDiff = Math.abs(existing.quantity - needed);
-      if (qtyDiff < (needed * 0.05)) {
-        const sideMidpoint = side === 'YES' ? midpoint : (1000000 - midpoint);
-        const distance = Math.abs(price - sideMidpoint);
-        const score = maxSpread > 0 ? Math.pow(Math.max(0, (maxSpread - distance) / maxSpread), 2) : 0;
-        console.log(`✅ [${side}] Yield order active at ${(price / 1e6).toFixed(3)} | 📈 Score: ${score.toFixed(2)}`);
-        budgetTracker.remaining -= (existing.quantity * existing.price) / 1e12;
-        return;
-      }
-    }
-
-    if (existing) {
-      console.log(`[PURGE] Replacing stale BID for ${side} at ${(existing.price / 1e6).toFixed(3)}...`);
-      await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => { });
-    }
-
-    console.log(`[REWARDS] Placing BUY ${side} at ${(effectivePrice / 1e6).toFixed(3)} (Qty: ${(needed / 1e6).toFixed(1)})${isPartial ? ' (PARTIAL)' : ''}`);
-    budgetTracker.remaining -= ((needed * effectivePrice) / 1e12) * MARGIN_FACTOR;
-    await client.createLimitOrder({ marketAppId: marketId, position: posId, price: Math.round(effectivePrice), quantity: Math.round(needed), isBuying: true }).catch(e => console.error(`❌ BID Error (${side}): ${e.message}`));
-  }
-
-  async function maintainAsk(side: 'YES' | 'NO', currentInv: number, unmatchedInv: number) {
-    const posId = side === 'YES' ? 1 : 0;
-    const existing = marketOrders.find(o => o.position === posId && o.side === 0);
-
-    if (currentInv < 100000) {
-      // Indexer Latch: Only reset if inventory is 0 for 5 consecutive ticks
-      zeroInvTicks[side]++;
-      if (zeroInvTicks[side] < 5) {
-        console.log(`[STABILITY] ${side} reported as zero. Waiting for confirmation...`);
-        return;
-      }
-
-      if (existing) {
-        console.log(`[PURGE] Clearing residual ASK for ${side}`);
-        await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => { });
-      }
-      inventoryTicks[side] = 0;
-      entryMidpoints[side] = 0;
-      return;
-    }
-
-    zeroInvTicks[side] = 0; // Reset latch if we have inventory
-    inventoryTicks[side]++;
-    if (inventoryTicks[side] === 1 || entryMidpoints[side] === 0) {
-      entryMidpoints[side] = midpoint;
-    }
-
-    const sideMidpoint = side === 'YES' ? midpoint : (1000000 - midpoint);
-    const entrySideMidpoint = side === 'YES' ? entryMidpoints[side] : (1000000 - entryMidpoints[side]);
-
-    // 1. Physical Stop-Loss: Only count assets we actually HOLD in our wallet
-    // We do NOT count pending orders as hedges anymore.
-    const realUnmatchedInv = Math.abs(yesInv - noInv);
-
-    // 5% Circuit Breaker (Emergency Stop) 
-    if (realUnmatchedInv > 100000 && currentInv > matchedInv) {
-      const loss = entrySideMidpoint - sideMidpoint;
-      // Sanity Check: Don't hedge if the deviation from API is too extreme (likely bad data)
-      const isDataSane = Math.abs(sideMidpoint - (side === 'YES' ? market.midpoint : (1000000 - market.midpoint))) < 150000;
-
-      if (loss > 50000 && isDataSane) { // 5¢ threshold
-        console.log(`🚨 [EMERGENCY] ${side} position is losing ${(loss / 10000).toFixed(1)}¢. Triggering Physical Stop-Loss...`);
-        if (existing) await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => { });
-        await client.createMarketOrder({
-          marketAppId: marketId,
-          position: posId,
-          quantity: currentInv,
-          isBuying: false,
-          price: sideMidpoint,
-          slippage: 50000
-        }).catch(e => console.error(`❌ EMERGENCY EXIT Error (${side}): ${e.message}`));
-        return;
-      }
-    }
-
-    // B: Check if this side is winning or losing vs entry
-    const isWinning = sideMidpoint >= entrySideMidpoint;
-
-    const ticks = inventoryTicks[side];
-    let targetAskPrice = sideMidpoint + effectiveBuffer; // Phase 1: Profit Window Target
-    let modeText = `Profit Window ${ticks}/${liquidationWindow}`;
-
-    // A: Check Reward Status & Extreme Volatility
-    const book = bookSnapshot[marketId.toString()];
-    const isBookDeep = (book?.bids?.length || 0) > 1 && (book?.asks?.length || 0) > 1;
-    const priceDrift = entrySideMidpoint - sideMidpoint;
-
-    if (priceDrift > 30000 && realUnmatchedInv > 100000) {
-      // Phase 4: Volatility Bypass (Sharp drop detected, don't wait for windows)
-      targetAskPrice = sideMidpoint - 3000;
-      modeText = `Volatility Exit (-${(priceDrift / 10000).toFixed(1)}¢)`;
-    } else if (!isBookDeep && currentInv > 100000) {
-      targetAskPrice = sideMidpoint;
-      modeText = `Force Exit (Market Illiquid)`;
-    } else if (ticks > liquidationWindow) {
-      if (!isWinning && realUnmatchedInv > 100000) {
-        // Phase 3: Aggressive Exit (Losing side with real exposure)
-        const overTicks = ticks - liquidationWindow;
-        if (overTicks <= 5) {
-          targetAskPrice = sideMidpoint - 1000; // -0.1¢
-          modeText = `Gentle Exit (${overTicks}t over)`;
-        } else if (overTicks <= 10) {
-          targetAskPrice = sideMidpoint - 3000; // -0.3¢
-          modeText = `Firm Exit (${overTicks}t over)`;
-        } else {
-          targetAskPrice = sideMidpoint - 5000; // -0.5¢
-          modeText = `Forced Exit (${overTicks}t over)`;
+        if (needsRefresh) {
+          await startCycle();
         }
       } else {
-        // Phase 2: Breakeven Exit (Winning side OR fully matched)
-        targetAskPrice = sideMidpoint;
-        modeText = isWinning ? `Profit Hold (${ticks}t)` : `Matched Hold (${ticks}t)`;
+        await startCycle();
       }
-    }
+    } catch (e) { }
+  };
 
-    if (existing && Math.abs(existing.price - targetAskPrice) <= 2000) {
-      console.log(`✅ [${side}] Sale order active at ${(targetAskPrice / 1e6).toFixed(3)} (${modeText})`);
+  // Pulse immediately then every 5s
+  monitor();
+  setInterval(monitor, 5000);
+
+  // --- Initial Entry ---
+  await startCycle();
+}
+
+
+async function calculateTargetSize(algod: algosdk.Algodv2, address: string, minSize: number) {
+  const accountInfo = await algod.accountInformation(address).do();
+  const usdcAsset = accountInfo.assets?.find((a: any) => Number(a.assetId ?? a['asset-id']) === 31566704);
+  const walletUsdc = Number(usdcAsset ? usdcAsset.amount : 0);
+
+  if (useMax) {
+    return Math.floor(walletUsdc * (1 - USDC_BUFFER_PERCENT));
+  } else if (injectAmount) {
+    // Current Wallet + Inject
+    return Math.floor((walletUsdc + (injectAmount * 1e6)) * (1 - USDC_BUFFER_PERCENT));
+  } else {
+    if (walletUsdc < minSize) {
+      console.error(`❌ [ERROR] Insufficient USDC ($${(walletUsdc / 1e6).toFixed(2)}) for Reward Minimum ($${(minSize / 1e6).toFixed(2)})`);
+      process.exit(1);
+    }
+    return minSize;
+  }
+}
+
+async function startCycle() {
+  if (isProcessingFill || isShuttingDown) return;
+  
+  try {
+    // Phase 2: Placement
+    currentPhase = 'SPLIT';
+    await cancelAllOrders(globalClient, globalAddress, activeMarketId);
+
+    // If we have existing unbalanced inventory, try to fix it before splitting more
+    const positions = await globalClient.getPositions(globalAddress);
+    const mPos = positions.find(p => p.marketAppId === activeMarketId);
+    const yesInv = mPos?.yesBalance || 0;
+    const noInv = mPos?.noBalance || 0;
+    
+    const delta = Math.abs(yesInv - noInv);
+    if (delta > DUST_THRESHOLD) {
+      console.log(`[RECOVERY] Fixing imbalance of ${(delta/1e6).toFixed(1)} before cycle start...`);
+      await handleFill(0); // Trigger hedge logic without a new fill
       return;
     }
-    if (existing) {
-      console.log(`[PURGE] Replacing stale ASK for ${side} at ${(existing.price / 1e6).toFixed(3)}...`);
-      await client.cancelOrder({ marketAppId: marketId, escrowAppId: existing.escrowAppId, orderOwner: address }).catch(() => { });
+
+    // If we are already balanced and hold tokens, we can skip the SPLIT phase
+    // and go straight to MAKER with the existing tokens.
+    if (yesInv > DUST_THRESHOLD && targetShares < DUST_THRESHOLD) {
+      console.log(`[SYSTEM] Existing balanced position detected (${(yesInv/1e6).toFixed(1)} pairs). Skipping Split.`);
+    } else if (targetShares > DUST_THRESHOLD) {
+      console.log(`[SYSTEM] Splitting $${(targetShares / 1e6).toFixed(2)} USDC...`);
+      await globalClient.splitShares({ marketAppId: activeMarketId, amount: targetShares });
+    } else {
+      console.error(`❌ [ERROR] No available USDC and no existing position to market-make.`);
+      process.exit(1);
     }
-    console.log(`[HEDGE] Placing SELL ${side} at ${(targetAskPrice / 1e6).toFixed(3)} (${modeText})`);
-    await client.createLimitOrder({ marketAppId: marketId, position: posId, price: Math.round(targetAskPrice), quantity: Math.round(currentInv), isBuying: false }).catch(e => console.error(`❌ ASK Error (${side}): ${e.message}`));
-  }
 
-  // C: Calculate matched inventory (YES+NO pairs are price-neutral)
-  const matchedInv = Math.min(yesInv, noInv);
-  if (matchedInv > 100000) {
-    console.log(`🔄 [MATCH] ${(matchedInv / 1e6).toFixed(1)} matched YES+NO sets — hedged against price risk.`);
-  }
+    currentPhase = 'MAKER';
+    
+    // Calculate prices based on REWARD metadata, not live CLOB midpoint
+    // We place orders just inside the reward boundary (95% of the way to the edge)
+    const yesPrice = rewardsMidpoint + Math.round(rewardsSpread * 0.95);
+    const noPrice = (1000000 - rewardsMidpoint) + Math.round(rewardsSpread * 0.95);
 
-  await maintainBid('YES', midpoint - effectiveBuffer, yesInv);
-  await maintainAsk('YES', yesInv, yesInv - matchedInv);
-  await maintainBid('NO', (1000000 - midpoint) - effectiveBuffer, noInv);
-  await maintainAsk('NO', noInv, noInv - matchedInv);
-
-  return { midpoint, cooldownTicks: currentCooldown };
-}
-
-async function getTickStats(client: AlphaClient, algodClient: algosdk.Algodv2, address: string, marketId: number, targetShares: number, rewardMarkets: any[]) {
-  try {
-    const [positions, accountInfo] = await Promise.all([
-      client.getPositions(address),
-      algodClient.accountInformation(address).do()
+    console.log(`🌱 [MAKER] Placing ASKS | YES: $${(yesPrice / 1e6).toFixed(3)} | NO: $${(noPrice / 1e6).toFixed(3)}`);
+    await Promise.all([
+      globalClient.createLimitOrder({ marketAppId: activeMarketId, position: 1, price: yesPrice, quantity: targetShares, isBuying: false }),
+      globalClient.createLimitOrder({ marketAppId: activeMarketId, position: 0, price: noPrice, quantity: targetShares, isBuying: false })
     ]);
-    const market = rewardMarkets.find((m: any) => m.marketAppId === marketId);
-    const mPos = positions.find(p => p.marketAppId === marketId);
-    const usdcAsset = accountInfo.assets?.find((a: any) => Number(a.assetId ?? a['asset-id']) === 31566704);
 
-    return {
-      size: targetShares,
-      yesMySize: (mPos?.yesBalance || 0) / 1e6,
-      noMySize: (mPos?.noBalance || 0) / 1e6,
-      walletUsdc: Number(usdcAsset ? usdcAsset.amount : 0) / 1e6,
-      status: 'online',
-      activity: 'Ticking...'
-    };
-  } catch (e) { return {}; }
+  } catch (e: any) {
+    console.error(`❌ [CYCLE ERROR] ${e.message}`);
+    currentPhase = 'ERROR';
+  }
 }
+
+async function handleFill(quantityFilled: number) {
+  if (isShuttingDown) return;
+  isProcessingFill = true;
+
+  try {
+    currentPhase = 'HEDGE';
+    if (quantityFilled > 0) {
+      console.log(`🚨 [TRIGGER] Fill detected! quantity: ${(quantityFilled / 1e6).toFixed(1)}`);
+    }
+
+    // 1. KILLSWITCH
+    await cancelAllOrders(globalClient, globalAddress, activeMarketId);
+
+    // 2. DELTA CALCULATION
+    const currentPos = await globalClient.getPositions(globalAddress);
+    const mPos = currentPos.find(p => p.marketAppId === activeMarketId);
+    const yesInv = mPos?.yesBalance || 0;
+    const noInv = mPos?.noBalance || 0;
+    const delta = Math.abs(yesInv - noInv);
+
+    if (delta > DUST_THRESHOLD) {
+      // 3. AGGRESSIVE TAKER HEDGE
+      const marketData = await globalClient.getMarket(activeMarketId.toString());
+      const midpoint = Number(marketData?.midpoint || 500_000);
+      const posToBuy = yesInv > noInv ? 0 : 1; 
+      const price = posToBuy === 1 ? midpoint : (1000000 - midpoint);
+
+      console.log(`[HEDGE] Buying ${(delta / 1e6).toFixed(2)} ${posToBuy === 1 ? 'YES' : 'NO'} at market...`);
+      await globalClient.createMarketOrder({
+        marketAppId: activeMarketId,
+        position: posToBuy as any,
+        quantity: delta,
+        price: price as any,
+        isBuying: true,
+        slippage: Math.round(1000000 * MAX_SLIPPAGE_TOLERANCE)
+      });
+    }
+
+    // 4. SETTLE
+    currentPhase = 'RECYCLE';
+    const finalPos = await globalClient.getPositions(globalAddress);
+    const fPos = finalPos.find(p => p.marketAppId === activeMarketId);
+    const mergeQty = Math.min(fPos?.yesBalance || 0, fPos?.noBalance || 0);
+
+    if (mergeQty > DUST_THRESHOLD) {
+      console.log(`[RECYCLE] Merging ${(mergeQty / 1e6).toFixed(1)} pairs...`);
+      await globalClient.mergeShares({ marketAppId: activeMarketId, amount: mergeQty });
+    }
+
+    console.log(`[SYSTEM] Cycle complete. Restarting...`);
+    isProcessingFill = false;
+    
+    // Refresh target size in case injection or max deployment changed
+    const market = await globalClient.getRewardMarkets().then(ms => ms.find(m => m.marketAppId === activeMarketId));
+    targetShares = await calculateTargetSize(globalAlgod, globalAddress, market?.rewardsMinContracts || 100_000_000);
+    
+    await startCycle();
+
+  } catch (e: any) {
+    console.error(`❌ [HEDGE ERROR] ${e.message}`);
+    isProcessingFill = false;
+  }
+}
+
+async function cancelAllOrders(client: AlphaClient, address: string, marketId: number) {
+  try {
+    const orders = await client.getWalletOrdersFromApi(address);
+    const mOrders = orders.filter(o => Number(o.marketAppId) === marketId);
+    if (mOrders.length > 0) {
+      console.log(`[SYSTEM] Cancelling ${mOrders.length} orders...`);
+      await Promise.all(mOrders.map(o =>
+        client.cancelOrder({
+          marketAppId: marketId,
+          escrowAppId: o.escrowAppId,
+          orderOwner: address
+        }).catch(() => { })
+      ));
+    }
+  } catch (e) { }
+}
+
+async function cleanup(client: AlphaClient, address: string, shouldClean: boolean) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`\n🛑 [SHUTDOWN] Cleaning up...`);
+
+  if (shouldClean) {
+    await cancelAllOrders(client, address, activeMarketId);
+    const pos = await client.getPositions(address);
+    const mPos = pos.find(p => p.marketAppId === activeMarketId);
+    if (mPos) {
+      const matched = Math.min(mPos.yesBalance, mPos.noBalance);
+      if (matched > DUST_THRESHOLD) {
+        console.log(`[SHUTDOWN] Final Merge: ${(matched / 1e6).toFixed(1)} pairs...`);
+        await client.mergeShares({ marketAppId: activeMarketId, amount: matched }).catch(() => { });
+      }
+    }
+  }
+
+  process.exit(0);
+}
+
+process.on('SIGINT', () => {
+  if (globalClient && globalAddress) {
+    cleanup(globalClient, globalAddress, true);
+  } else {
+    process.exit(0);
+  }
+});
 
 main().catch(console.error);

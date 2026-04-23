@@ -14,7 +14,8 @@ import {
   AlertCircle, 
   TrendingUp, 
   Gift,
-  Zap
+  Zap,
+  Trash2
 } from 'lucide-react';
 import algosdk from 'algosdk';
 import axios from 'axios';
@@ -121,11 +122,45 @@ function App() {
     }
   };
 
+  const handleCleanup = async () => {
+    try {
+      setLoading(true);
+      // 1. Dry Run First
+      const dryRunResp = await axios.post(`${BACKEND_URL}/api/bot/cleanup?dryRun=true`);
+      const { count, estimatedReclaim } = dryRunResp.data;
+
+      if (count === 0) {
+        alert("Wallet is already clean! No unused assets found.");
+        return;
+      }
+
+      // 2. Ask for confirmation with facts
+      const confirmed = window.confirm(
+        `🧹 CLEANUP PREVIEW:\n\n` +
+        `• Found ${count} unused market assets.\n` +
+        `• Reclaiming these will unlock ~${estimatedReclaim.toFixed(1)} ALGO.\n` +
+        `• Active orders and current bot markets are PROTECTED.\n\n` +
+        `Proceed with opt-out?`
+      );
+
+      if (!confirmed) return;
+
+      // 3. Execute real cleanup
+      const resp = await axios.post(`${BACKEND_URL}/api/bot/cleanup`);
+      alert(resp.data.message);
+      fetchStatus();
+    } catch (err: any) {
+      alert(`Cleanup failed: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const getBestOpportunity = () => {
     const activeMarketId = botConfig?.targetMarketId;
     if (!activeMarketId || !markets.length) return null;
 
-    const currentMarket = markets.find(m => m.marketAppId === activeMarketId);
+    const currentMarket = markets.find(m => m.marketAppId === Number(activeMarketId));
     if (!currentMarket) return null;
 
     const currentScore = currentMarket.efficiencyScore || 0;
@@ -134,13 +169,13 @@ function App() {
     const betterMarket = markets
       .filter(m => 
         m.isReward && 
-        m.marketAppId !== activeMarketId &&
+        m.marketAppId !== Number(activeMarketId) &&
         (m.safetyGap || 0) >= 0 &&
-        (m.rewardsMinContracts || 0) <= (currentMin * 1.5) // Similar or lower risk
+        (m.rewardsMinContracts || 0) <= (currentMin * 1.5)
       )
       .sort((a, b) => (b.efficiencyScore || 0) - (a.efficiencyScore || 0))[0];
 
-    if (betterMarket && (betterMarket.efficiencyScore || 0) > (currentScore * 1.25)) {
+    if (betterMarket && currentScore > 0 && (betterMarket.efficiencyScore || 0) > (currentScore * 1.25)) {
       return {
         market: betterMarket,
         improvementPercent: Math.round(((betterMarket.efficiencyScore / currentScore) - 1) * 100)
@@ -220,9 +255,9 @@ function App() {
                 </span>
              </div>
 
-             {botStatus?.fleet && botStatus.fleet.length > 0 ? (
-               botStatus.fleet.map((bot: any) => (
-                 <div key={bot.botId} className="bg-gradient-to-br p-4 rounded-2xl border transition-all from-green-600/10 to-blue-600/10 border-green-500/20">
+              {botStatus?.fleet && botStatus.fleet.length > 0 ? (
+                botStatus.fleet.map((bot: any, idx: number) => (
+                  <div key={`${bot.botId || 'fleet'}-${idx}`} className="bg-gradient-to-br p-4 rounded-2xl border transition-all from-green-600/10 to-blue-600/10 border-green-500/20">
                    <div className="flex flex-col gap-3">
                      <div className="flex items-center justify-between">
                        <div className="flex items-center gap-2">
@@ -480,7 +515,7 @@ function App() {
                 </div>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {Object.values(botStatus?.fleet || {}).map((bot: any, idx: number) => (
-                    <div key={idx} className="bg-black/20 rounded-2xl p-5 border border-white/5 space-y-4 hover:border-blue-500/30 transition-all">
+                    <div key={`${bot.botId || 'bot'}-${idx}`} className="bg-black/20 rounded-2xl p-5 border border-white/5 space-y-4 hover:border-blue-500/30 transition-all">
                       <div className="flex justify-between items-start">
                         <div className="flex-1">
                           <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider">{bot.name || 'Bot Instance'}</p>
@@ -627,6 +662,24 @@ function App() {
                     </button>
                   </div>
                 </div>
+              </div>
+
+              <div className="bg-white/5 border border-white/10 p-6 rounded-3xl space-y-4">
+                <h3 className="text-sm font-black flex items-center gap-2">
+                  <ShieldCheck size={18} className="text-blue-400" /> Wallet Health
+                </h3>
+                <p className="text-[10px] text-gray-500 font-medium leading-relaxed">
+                  Cleanup unused market tokens to reclaim ALGO Minimum Balance (MBR). 
+                  Each unused market token locks 0.1 ALGO.
+                </p>
+                <button 
+                  onClick={handleCleanup}
+                  disabled={loading}
+                  className="w-full py-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center justify-center gap-2"
+                >
+                  {loading ? <RefreshCcw size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                  Reclaim ALGO MBR
+                </button>
               </div>
 
               <div className="bg-yellow-500/5 border border-yellow-500/10 p-6 rounded-3xl flex gap-4">
